@@ -1,8 +1,8 @@
 aiogram==3.10.0
-fastapi
-uvicorn
-pydantic
-telethon
-PySocks
-httpx
-opentele
+fastapi==0.110.0
+uvicorn==0.28.0
+pydantic==2.6.4
+telethon==1.34.0
+PySocks==1.7.1
+httpx==0.27.0
+opentele==1.15.1
